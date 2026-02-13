@@ -139,3 +139,91 @@ def test_walk_forward_analysis_returns_windows_and_summary_contract():
     }
     assert summary_keys.issubset(results["summary"].keys())
     assert results["summary"]["total_windows"] == len(results["windows"])
+
+class SparseMarkingStrategy(BaseStrategy):
+    def __init__(self) -> None:
+        super().__init__("Sparse Marking")
+
+    def generate_signals(
+        self,
+        market_data: pd.DataFrame,
+        alternative_data: pd.DataFrame | None = None,
+        market_regime: dict | None = None,
+    ) -> list[Signal]:
+        if market_data.empty:
+            return []
+        aaa = market_data[market_data["symbol"] == "AAA"].sort_values("date")
+        if aaa.empty:
+            return []
+        price = float(aaa.iloc[-1]["close"])
+        return [
+            Signal(
+                symbol="AAA",
+                action="BUY",
+                price=price,
+                quantity=0,
+                stop_loss=price * 0.9,
+                target=price * 1.5,
+                strategy=self.name,
+                confidence=0.9,
+                timestamp=datetime.now(),
+            )
+        ]
+
+    def check_exit_conditions(self, position: dict, current_data: pd.Series) -> tuple[bool, str | None]:
+        return False, None
+
+
+def test_backtest_marks_open_positions_when_symbol_missing_for_day():
+    dates = pd.date_range("2024-01-01", periods=5, freq="B")
+    rows: list[dict] = []
+
+    aaa_close = {
+        dates[0]: 100.0,
+        dates[1]: 102.0,
+        dates[3]: 101.0,
+        dates[4]: 103.0,
+    }
+    for dt, close in aaa_close.items():
+        rows.append(
+            {
+                "symbol": "AAA",
+                "date": dt,
+                "open": close,
+                "high": close * 1.01,
+                "low": close * 0.99,
+                "close": close,
+                "volume": 1_000_000,
+            }
+        )
+
+    for dt in dates:
+        close = 50.0
+        rows.append(
+            {
+                "symbol": "BBB",
+                "date": dt,
+                "open": close,
+                "high": close * 1.01,
+                "low": close * 0.99,
+                "close": close,
+                "volume": 1_000_000,
+            }
+        )
+
+    market_data = pd.DataFrame(rows)
+    strategy = SparseMarkingStrategy()
+    engine = BacktestEngine(initial_capital=100000)
+
+    results = engine.run_backtest(
+        strategy=strategy,
+        market_data=market_data,
+        start_date="2024-01-01",
+        end_date="2024-01-05",
+    )
+
+    day_with_missing_aaa = next(
+        row for row in results["portfolio_history"] if row["date"] == str(dates[2].date())
+    )
+    assert day_with_missing_aaa["num_positions"] >= 1
+    assert day_with_missing_aaa["positions_value"] > 0

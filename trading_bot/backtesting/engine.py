@@ -118,7 +118,7 @@ class BacktestEngine:
             transaction_cost=tx_cost,
             highest_close=price,
             lowest_close=price,
-            metadata=dict(signal.metadata or {}),
+            metadata={**dict(signal.metadata or {}), "last_mark_price": price},
         )
         self.state.cash -= total
 
@@ -147,6 +147,7 @@ class BacktestEngine:
             current_close = float(current["close"])
             position.highest_close = max(position.highest_close, current_close)
             position.lowest_close = min(position.lowest_close, current_close)
+            position.metadata["last_mark_price"] = current_close
             current_ema = ema_cache.get(symbol)
             should_exit, reason = strategy.check_exit_conditions(
                 {
@@ -206,8 +207,12 @@ class BacktestEngine:
         positions_value = 0.0
         for symbol, pos in self.state.positions.items():
             row = daily_data[daily_data["symbol"] == symbol]
-            if not row.empty:
-                positions_value += pos.quantity * float(row.iloc[0]["close"])
+            if row.empty:
+                mark_price = float(pos.metadata.get("last_mark_price", pos.entry_price))
+            else:
+                mark_price = float(row.iloc[0]["close"])
+                pos.metadata["last_mark_price"] = mark_price
+            positions_value += pos.quantity * mark_price
 
         total = self.state.cash + positions_value
         self.state.portfolio_history.append(
