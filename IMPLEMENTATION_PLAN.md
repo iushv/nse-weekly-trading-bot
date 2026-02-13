@@ -3,7 +3,7 @@
 ## Objective
 Build a modular Indian swing-trading system with strategy diversification, strict risk controls, backtesting-first workflow, and guarded transition to live execution.
 
-## Delivery Status Snapshot (as of 2026-02-12)
+## Delivery Status Snapshot (as of 2026-02-13)
 1. Foundation, data, strategies, backtesting, risk, reporting, and orchestrator: **Completed**
 2. CI quality gates (`ruff`, `mypy`, `pytest`) and integration tests: **Completed**
 3. Groww integration (token flow + order/positions/margins endpoints): **Completed**
@@ -58,6 +58,7 @@ Build a modular Indian swing-trading system with strategy diversification, stric
 52. Adaptive win-rate waiver linkage + lower closed-trade floor + calibrated trend-consistency filter: **Completed**
 53. Weekly audit trend summary enhanced with waiver-fire-rate line items: **Completed**
 54. Adaptive-only paper-run started with session tracking: **In Progress**
+55. Backtest mark-to-market fallback for sparse daily bars + regression test coverage: **Completed**
 
 ## Completed Milestones
 ### Phase 1-2: Foundation + Data Infra
@@ -156,6 +157,21 @@ Build a modular Indian swing-trading system with strategy diversification, stric
 4. Post-change regression checks:
    - `structural_gate_sweep` (bounded) still shows known baseline behavior.
    - `multi_week_gate_search` (bounded) remains robustness-blocked (no anchor pass lift yet).
+
+
+## 2026-02-13 Validation Update
+1. Backtest valuation correction:
+   - Fixed `BacktestEngine` mark-to-market when a symbol is missing on a trading day (fallback to last known mark instead of zero).
+   - Regression test added: `tests/test_backtesting_integration.py::test_backtest_marks_open_positions_when_symbol_missing_for_day`.
+2. Full test suite status:
+   - `pytest -q`: pass (`89 passed`).
+3. Extended continuous adaptive backtest (2025-01-01 to 2026-02-12):
+   - Artifact: `reports/backtests/adaptive_continuous_20260213_185x_fix_193638.json`
+   - Metrics: return `+0.30%`, Sharpe `0.15`, max drawdown `-6.73%`, total trades `41`, win rate `48.8%`, profit factor `1.05`.
+4. Walk-forward robustness check (3m train / 2m test):
+   - Artifact: `reports/backtests/adaptive_walk_forward_3x2_fix_20260213_193711.json`
+   - Summary: avg return `-0.53%`, consistency `0/3` profitable windows, avg Sharpe `-0.93`.
+   - Interpretation: anchor robustness improved, but long-window robustness remains weak; keep paper-run gate conservative until additional edge work.
 
 ## Experiment History (Implemented But Failed / No Improvement)
 This section tracks major implemented experiment rounds that did not improve promotion readiness.
