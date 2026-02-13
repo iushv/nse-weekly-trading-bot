@@ -68,7 +68,6 @@ Build a modular Indian swing-trading system with strategy diversification, stric
 
 ### Phase 3-4: Strategies + Backtesting
 - Implemented `momentum_breakout`, `mean_reversion`, `sector_rotation`.
-- Added experimental `contrarian` placeholder for future R&D.
 - Backtest engine and walk-forward analysis implemented with transaction costs.
 
 ### Phase 5-7: Risk, Execution, Reporting, Orchestration

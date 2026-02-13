@@ -52,7 +52,6 @@ new-trading-bot/
 │   │   ├── sector_rotation.py       # Legacy (disabled)
 │   │   ├── bear_reversal.py         # Legacy (disabled)
 │   │   ├── volatility_reversal.py   # Legacy (disabled)
-│   │   └── contrarian.py            # Placeholder (unused)
 │   ├── backtesting/
 │   │   ├── engine.py                # BacktestEngine with trailing-stop support
 │   │   ├── walk_forward.py          # Walk-forward analysis
@@ -325,7 +324,7 @@ Live orders require explicit arming:
 |-------|--------|------------|----------|-------------|---------|
 | Momentum tuning | Feb 11-12 | ~40 | momentum_breakout (v2-v6) | 1/4 anchors | Cost drag structural; no param set overcomes 5.3%+ weekly drag |
 | Strategy mix | Feb 12 | ~20 | momentum + mean_rev + sector | 1/4 anchors | Diversification doesn't help when all strategies overtrade |
-| Bear/Vol reversal | Feb 12 | ~18 | bear_reversal, volatility_reversal | 1/4 anchors | Short-hold contrarian adds noise, doesn't improve robustness |
+| Bear/Vol reversal | Feb 12 | ~18 | bear_reversal, volatility_reversal | 1/4 anchors | Short-hold reversal signals add noise, doesn't improve robustness |
 | Defensive breadth | Feb 12 | ~8 | Breadth-gated momentum | 0/4 anchors | Reducing entries without fixing economics reduces signal |
 | Adaptive trend v1 | Feb 12 | 4 | adaptive_trend (broken exits) | 0/4 anchors | Regime mismatch + wide stops + no trailing engagement |
 | Regime alignment | Feb 12 | 3 | adaptive_trend (regime fixed) | 0/4 anchors | Improved funnel but exits still STOP_LOSS heavy |
