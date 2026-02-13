@@ -1,0 +1,30 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual envs
+.venv/
+venv/
+
+# Local env and secrets
+.env
+
+# Runtime artifacts
+logs/
+reports/
+*.log
+control/*.pid
+control/*.log
+control/*.json
+control/*.txt
+control/*.flag
+
+# Local databases
+*.db
+*.sqlite
+
+# Tooling
+.pytest_cache/
+.coverage
+.DS_Store
