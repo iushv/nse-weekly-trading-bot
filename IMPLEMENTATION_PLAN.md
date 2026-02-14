@@ -702,6 +702,70 @@ This section tracks major implemented experiment rounds that did not improve pro
 > 6 new files, 8 modified files. No existing strategies are removed.
 
 
+## 2026-02-14 Data Source Migration (bhavcopy)
+
+### Problem
+yfinance completely broken for NSE `.NS` symbols regardless of version:
+- v0.2.33 / v0.2.50: `datetime - str` TypeError, timezone errors, empty body (rate-limit/cookie blocking)
+- v1.1.0: 404 `Quote not found for symbol: TATAMOTORS.NS`
+- US stocks (AAPL) work fine — Yahoo reachable but NSE symbols blocked
+
+Groww historical API tested: auth works (token refresh confirmed), but `/v1/historical/candles` returns 403 — requires Pro/Premium plan. Standard developer key only covers order + auth endpoints.
+
+Alternatives tested and failed:
+- `jugaad-data 0.29`: JSONDecodeError — NSE blocks without JS-rendered cookies
+- `pandas-datareader` Stooq: 0 rows — doesn't carry NSE individual stocks
+- BSE Bhavcopy (old URL): 404
+
+### Solution: NSE UDiFF Bhavcopy
+NSE switched to CM-UDiFF Common Bhavcopy format from July 8, 2024.
+
+URL format: `https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_YYYYMMDD_F_0000.csv.zip`
+
+Returns 3250 rows (2410 EQ-series stocks) per day, 182KB ZIP. No auth required, no rate limiting observed.
+
+### Symbol Demerger Fixes
+6 symbols in Midcap 150 universe no longer exist in bhavcopy:
+
+| Old Symbol | New Symbol | Reason |
+|---|---|---|
+| `AEGISCHEM` | `AEGISVOPAK` | Demerged → Aegis Vopak Terminals (mid-2025) |
+| `AMARAJABAT` | `ARE&M` | Renamed to Amara Raja Energy & Mobility |
+| `GMRINFRA` | `GMRAIRPORT` | Demerged → GMR Airports (mid-2025) |
+| `SAILCORP` | `SAIL` | Invalid symbol, Steel Authority is SAIL |
+| `TATAMOTORS` | `TMCV` | Demerged CV business (~late 2025) |
+| `VARUNBEV` | `VBL` | Symbol changed to VBL |
+
+Updated files:
+- `data/universe/nifty_midcap150.txt`
+- `data/cache/nifty_midcap150_symbols.json`
+
+### Code Changes (`trading_bot/data/collectors/market_data.py`)
+- Added `_bhavcopy_cache: dict` to cache full day DataFrames in memory
+- Added `_fetch_bhavcopy_day(trading_date)`: downloads + extracts ZIP, filters EQ-series, caches
+- Added `_fetch_historical_data_bhavcopy(symbol, start_date, end_date)`: day-by-day OHLCV build
+- Updated `fetch_historical_data()` priority: `bhavcopy` first for `auto` provider
+- Added `"bhavcopy"` to valid provider list
+- Config: `MARKET_DATA_PROVIDER=bhavcopy` in `.env`
+
+### Backfill Completed
+- Pass 1: 151 symbols backfilled (2024-01-01 → 2026-02-14), 524 rows each
+  - `AEGISCHEM`: 105 rows (partial — existed until demerger mid-2025)
+  - `GMRINFRA`: 232 rows (partial — existed until demerger)
+  - `TATAMOTORS`: 447 rows (partial — demerged late 2025)
+  - `AMARAJABAT`, `SAILCORP`, `VARUNBEV`: 0 rows (confirmed dead symbols)
+- Pass 2: 6 renamed symbols backfilled
+  - `AEGISVOPAK`: 177 rows, `GMRAIRPORT`: 292 rows, `TMCV`: 55 rows
+  - `ARE&M`, `SAIL`, `VBL`: 524 rows each
+- Database: `trading_bot.db` fully populated, 157 distinct symbols
+
+### Bot Restart
+- Started via `python main.py --mode paper`
+- Confirmed: `Using UNIVERSE_FILE universe: 151 symbols`, all 3 strategies enabled, scheduler started, no errors
+- Task Scheduler update pending (requires admin PowerShell)
+
+---
+
 ## Midcap 150 Universe Pivot (Decision)
 - Baseline (Nifty 50-ish universe, 6-month continuous): near-zero edge
   - Artifact: `reports/backtests/adaptive_continuous_6m_20250801_20260212_20260214_054821.json`

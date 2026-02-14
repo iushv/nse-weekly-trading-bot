@@ -7,6 +7,9 @@ from io import StringIO
 from pathlib import Path
 from typing import Any
 
+import io
+import zipfile
+
 import pandas as pd
 import requests
 import yfinance as yf
@@ -25,7 +28,7 @@ class MarketDataCollector:
         self.market_data_provider = (
             (market_data_provider or Config.MARKET_DATA_PROVIDER or "auto").strip().lower()
         )
-        if self.market_data_provider not in {"auto", "yfinance", "groww"}:
+        if self.market_data_provider not in {"auto", "yfinance", "groww", "bhavcopy"}:
             logger.warning(f"Unknown MARKET_DATA_PROVIDER={self.market_data_provider}; using auto")
             self.market_data_provider = "auto"
         self.groww_exchange = Config.GROWW_HISTORICAL_EXCHANGE
@@ -45,6 +48,7 @@ class MarketDataCollector:
         self.nifty_cache_path = self.cache_dir / "nifty500_symbols.json"
         self.midcap_cache_path = self.cache_dir / "nifty_midcap150_symbols.json"
         self._groww_init_attempted = False
+        self._bhavcopy_cache: dict[str, pd.DataFrame] = {}  # date_str -> full day df
 
     @staticmethod
     def _clean_symbol(symbol: str) -> str:
@@ -326,6 +330,72 @@ class MarketDataCollector:
             logger.warning(f"Error fetching {symbol} via yfinance fallback download: {exc}")
             return None
 
+    def _fetch_bhavcopy_day(self, trading_date: date) -> pd.DataFrame | None:
+        """Download NSE UDiFF bhavcopy for a single trading day. Returns EQ-series DataFrame."""
+        date_str = trading_date.strftime("%Y%m%d")
+        if date_str in self._bhavcopy_cache:
+            return self._bhavcopy_cache[date_str]
+
+        url = f"https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{date_str}_F_0000.csv.zip"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "*/*",
+            "Referer": "https://www.nseindia.com/",
+        }
+        try:
+            r = requests.get(url, headers=headers, timeout=15)
+            if r.status_code == 404:
+                return None  # holiday / weekend
+            r.raise_for_status()
+            z = zipfile.ZipFile(io.BytesIO(r.content))
+            df = pd.read_csv(z.open(z.namelist()[0]))
+            eq = df[df["SctySrs"] == "EQ"][["TckrSymb", "TradDt", "OpnPric", "HghPric", "LwPric", "ClsPric", "TtlTradgVol"]].copy()
+            eq.columns = ["Symbol", "Date", "Open", "High", "Low", "Close", "Volume"]
+            eq["Date"] = pd.to_datetime(eq["Date"])
+            self._bhavcopy_cache[date_str] = eq
+            return eq
+        except Exception as exc:
+            logger.debug(f"Bhavcopy fetch failed for {trading_date}: {exc}")
+            return None
+
+    def _fetch_historical_data_bhavcopy(
+        self, symbol: str, start_date: str | datetime | date, end_date: datetime
+    ) -> pd.DataFrame | None:
+        """Fetch OHLCV from NSE UDiFF bhavcopy files (day-by-day). No auth required."""
+        clean = self._clean_symbol(symbol)
+        start_dt = pd.to_datetime(start_date).date()
+        end_dt = pd.to_datetime(end_date).date()
+
+        rows: list[dict] = []
+        cursor = start_dt
+        while cursor <= end_dt:
+            # Skip weekends
+            if cursor.weekday() < 5:
+                day_df = self._fetch_bhavcopy_day(cursor)
+                if day_df is not None:
+                    row = day_df[day_df["Symbol"] == clean]
+                    if not row.empty:
+                        r = row.iloc[0]
+                        rows.append({
+                            "Date": r["Date"],
+                            "Open": float(r["Open"]),
+                            "High": float(r["High"]),
+                            "Low": float(r["Low"]),
+                            "Close": float(r["Close"]),
+                            "Volume": float(r["Volume"]),
+                        })
+            cursor += timedelta(days=1)
+
+        if not rows:
+            logger.warning(f"No bhavcopy data found for {clean} ({start_dt} -> {end_dt})")
+            return None
+
+        df = pd.DataFrame(rows).drop_duplicates(subset=["Date"]).sort_values("Date").set_index("Date")
+        df["Adj Close"] = df["Close"]
+        df["Returns"] = df["Close"].pct_change()
+        df["ATR"] = self._calculate_atr(df)
+        return df
+
     def _fetch_historical_data_groww(
         self, symbol: str, start_date: str | datetime | date, end_date: datetime
     ) -> pd.DataFrame | None:
@@ -400,22 +470,30 @@ class MarketDataCollector:
             end_date = datetime.now()
 
         provider = self.market_data_provider
+
+        if provider == "bhavcopy":
+            bhav_df = self._fetch_historical_data_bhavcopy(symbol, start_date, end_date)
+            if bhav_df is not None and not bhav_df.empty:
+                return bhav_df
+            return None
+
         if provider == "groww":
             groww_df = self._fetch_historical_data_groww(symbol, start_date, end_date)
             if groww_df is not None and not groww_df.empty:
                 return groww_df
-            return self._fetch_historical_data_yfinance(symbol, start_date, end_date)
+            # Fall through to bhavcopy then yfinance
 
         if provider == "yfinance":
             return self._fetch_historical_data_yfinance(symbol, start_date, end_date)
 
+        # auto: bhavcopy first (most reliable for NSE), then yfinance
+        bhav_df = self._fetch_historical_data_bhavcopy(symbol, start_date, end_date)
+        if bhav_df is not None and not bhav_df.empty:
+            return bhav_df
+
         yf_df = self._fetch_historical_data_yfinance(symbol, start_date, end_date)
         if yf_df is not None and not yf_df.empty:
             return yf_df
-
-        groww_df = self._fetch_historical_data_groww(symbol, start_date, end_date)
-        if groww_df is not None and not groww_df.empty:
-            return groww_df
 
         logger.error(f"No historical data source succeeded for {symbol}")
         return None

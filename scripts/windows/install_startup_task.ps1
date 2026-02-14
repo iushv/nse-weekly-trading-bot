@@ -45,7 +45,7 @@ $settings = New-ScheduledTaskSettingsSet `
 $principal = New-ScheduledTaskPrincipal `
     -UserId $userId `
     -LogonType Interactive `
-    -RunLevel LeastPrivilege
+    -RunLevel Limited
 
 Register-ScheduledTask `
     -TaskName $TaskName `

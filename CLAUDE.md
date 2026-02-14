@@ -45,7 +45,7 @@ PYTHONPATH=. python scripts/preflight_check.py --pretty
 - **SQLite** via SQLAlchemy (default `trading_bot.db`; configurable via `DATABASE_URL`)
 - **pandas** for all market data manipulation
 - **loguru** for logging (not stdlib logging)
-- **yfinance** + Groww API for market data
+- **NSE UDiFF Bhavcopy** for market data (yfinance broken for NSE as of 2026-02-14; Groww historical requires paid plan)
 - **APScheduler** for scheduling routines
 - **pytest** for testing (29 test files in `tests/`)
 
@@ -146,7 +146,7 @@ Set in `.env` (see `.env.example` for full list):
 | `BROKER_PROVIDER` | `mock` | `mock`, `groww`, or `http` |
 | `DATABASE_URL` | `sqlite:///trading_bot.db` | SQLAlchemy connection string |
 | `STARTING_CAPITAL` | `100000` | Initial capital in INR |
-| `MARKET_DATA_PROVIDER` | `auto` | `auto`, `yfinance`, or `groww` |
+| `MARKET_DATA_PROVIDER` | `bhavcopy` | `bhavcopy` (default), `auto`, `yfinance`, or `groww` |
 | `LIVE_ORDER_EXECUTION_ENABLED` | `0` | Must be `1` to arm live orders |
 
 ## Testing Notes
@@ -158,16 +158,38 @@ Set in `.env` (see `.env.example` for full list):
 
 ## Current State
 
-- **Active universe**: Nifty Midcap 150 (pivoted from Nifty 50 due to near-zero edge)
+- **Active universe**: Nifty Midcap 150 (pivoted from Nifty 50 due to near-zero edge), 151 symbols
+- **Data source**: NSE UDiFF Bhavcopy (`MARKET_DATA_PROVIDER=bhavcopy`). Database fully backfilled 2024-01-01 → 2026-02-14.
 - **Backtest performance** (Midcap 150, Aug 2025-Feb 2026): +7.54% return, Sharpe 1.42, PF 1.94
 - **Walk-forward** (3x3, Jan 2024-Feb 2026): 4/7 profitable windows, avg +0.90%
-- **Paper-run status**: Restarted with midcap universe, streak counter at 0/4
+- **Paper-run status**: Running, streak counter at 0/4
+- **Phase 9 robustness**: 3/4 anchors as of 2026-02-13
 - **ML layer** (Phase 9E-9F): Not yet implemented; collecting features only
 - **Live trading**: Disabled; requires 4/4 weekly promotion gates + manual review
+
+## Data Source: NSE UDiFF Bhavcopy
+
+- **URL**: `https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_YYYYMMDD_F_0000.csv.zip`
+- Returns ~3250 rows (2410 EQ-series stocks) per trading day. 404 = holiday/weekend (skip silently).
+- No auth required. Full day ZIPs cached in memory — first symbol fetch is slow (~2.5 min for 2 years), subsequent symbols use cache.
+- **Do not use yfinance for NSE symbols** — broken across all versions as of 2026-02-14 (timezone bug, cookie blocking, 404s).
+- Groww historical data requires Pro/Premium API plan — standard developer key only covers auth + order endpoints.
+
+### Symbol Demerger Fixes (applied 2026-02-14)
+6 Midcap 150 symbols no longer exist; universe file updated:
+
+| Old | New | Reason |
+|-----|-----|--------|
+| `AEGISCHEM` | `AEGISVOPAK` | Demerged mid-2025 |
+| `AMARAJABAT` | `ARE&M` | Renamed |
+| `GMRINFRA` | `GMRAIRPORT` | Demerged mid-2025 |
+| `SAILCORP` | `SAIL` | Invalid symbol |
+| `TATAMOTORS` | `TMCV` | Demerged late 2025 |
+| `VARUNBEV` | `VBL` | Symbol change |
 
 ## Important Warnings
 
 - **Never enable `LIVE_ORDER_EXECUTION_ENABLED=1`** without completing 4/4 paper-run promotion gates
 - **Credential hygiene**: `.env` contains broker API keys and Telegram tokens. Never commit it.
-- **Rate limits**: Backfilling 140 midcap symbols hits yfinance rate limits; the system falls back to Groww API automatically
+- **Do not use yfinance for NSE data** — use bhavcopy provider only
 - The Q1 2025 period (Jan-Apr) is a known weak regime for midcap trend-following; the regime gate does not fully block entries during broad selloffs
