@@ -28,3 +28,7 @@ control/*.flag
 .pytest_cache/
 .coverage
 .DS_Store
+
+# Local data cache
+data/cache/
+data/universe/

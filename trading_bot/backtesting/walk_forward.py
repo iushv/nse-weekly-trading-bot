@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import matplotlib.pyplot as plt
 import pandas as pd
 from loguru import logger
 
@@ -87,6 +86,7 @@ class WalkForwardAnalysis:
         }
 
     def plot_results(self, results: dict, save_path: str | None = None) -> None:
+        import matplotlib.pyplot as plt
         df = pd.DataFrame(results.get("windows", []))
         if df.empty:
             return
