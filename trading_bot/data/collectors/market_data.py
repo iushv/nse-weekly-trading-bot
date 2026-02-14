@@ -457,20 +457,134 @@ class MarketDataCollector:
 
         logger.info(f"Filtered to {len(filtered)} liquid stocks")
         return filtered
+    def _batch_download_yfinance(
+        self,
+        symbols: list[str],
+        *,
+        start_date: datetime | date,
+        end_date: datetime,
+    ) -> dict[str, pd.DataFrame]:
+        """Best-effort batch OHLCV fetch via yfinance.
+
+        Returns mapping of original input symbol -> dataframe.
+        """
+        if not symbols:
+            return {}
+
+        # Map to yfinance tickers and back.
+        yf_map: dict[str, str] = {}
+        yf_symbols: list[str] = []
+        for sym in symbols:
+            yf_sym = self._normalize_yfinance_symbol(sym)
+            if not yf_sym:
+                continue
+            yf_map[yf_sym] = sym
+            yf_symbols.append(yf_sym)
+
+        if not yf_symbols:
+            return {}
+
+        try:
+            df = yf.download(
+                yf_symbols,
+                start=start_date,
+                end=end_date,
+                interval="1d",
+                group_by="ticker",
+                progress=False,
+                threads=False,
+                auto_adjust=False,
+            )
+        except Exception as exc:
+            logger.warning(f"Batch yfinance download failed for {len(yf_symbols)} tickers: {exc}")
+            return {}
+
+        if df is None or getattr(df, 'empty', True):
+            return {}
+
+        out: dict[str, pd.DataFrame] = {}
+
+        if not isinstance(df.columns, pd.MultiIndex):
+            # Single ticker download (or yfinance flattened output)
+            only = yf_symbols[0]
+            out[yf_map.get(only, only)] = df
+            return out
+
+        # MultiIndex output, could be (Ticker, Field) or (Field, Ticker)
+        lvl0 = set(str(x) for x in df.columns.get_level_values(0).unique())
+        field_names = {"Open", "High", "Low", "Close", "Adj Close", "Volume"}
+        ticker_first = not field_names.issubset(lvl0)
+
+        for yf_sym in yf_symbols:
+            try:
+                if ticker_first:
+                    if yf_sym not in df.columns.get_level_values(0):
+                        continue
+                    sub = df[yf_sym].copy()
+                else:
+                    if yf_sym not in df.columns.get_level_values(1):
+                        continue
+                    sub = df.xs(yf_sym, level=1, axis=1).copy()
+            except Exception:
+                continue
+
+            if sub is None or getattr(sub, 'empty', True):
+                continue
+            out[yf_map.get(yf_sym, yf_sym)] = sub
+
+        return out
+
     def update_daily_data(self, symbols: list[str]) -> None:
         today = datetime.now().date()
         fetch_start = today - timedelta(days=3)
         freshness_threshold = today - timedelta(days=3)
+
+        stale_symbols: list[str] = []
         skipped_fresh = 0
-        updated_symbols = 0
-        failed_symbols = 0
         for symbol in symbols:
+            latest_date = None
             try:
                 latest_date = self._get_latest_price_date(symbol)
-                if latest_date is not None and latest_date >= freshness_threshold:
-                    skipped_fresh += 1
-                    continue
+            except Exception:
+                latest_date = None
+            if latest_date is not None and latest_date >= freshness_threshold:
+                skipped_fresh += 1
+            else:
+                stale_symbols.append(symbol)
 
+        if not stale_symbols:
+            logger.info(
+                "Daily data update summary: symbols=%s updated=%s skipped_fresh=%s failed=%s",
+                len(symbols),
+                0,
+                skipped_fresh,
+                0,
+            )
+            return
+
+        updated_symbols = 0
+        failed_symbols = 0
+
+        provider = self.market_data_provider
+        batch_threshold = 25
+        remaining = list(stale_symbols)
+
+        # Batch yfinance download to reduce rate limiting for large universes.
+        if provider in {"auto", "yfinance"} and len(remaining) >= batch_threshold:
+            batch = self._batch_download_yfinance(remaining, start_date=fetch_start, end_date=datetime.now())
+            for sym, df in batch.items():
+                try:
+                    if df is not None and not df.empty:
+                        db.insert_price_data(df, sym)
+                        updated_symbols += 1
+                        if sym in remaining:
+                            remaining.remove(sym)
+                except Exception as exc:
+                    logger.warning(f"Batch insert failed for {sym}: {exc}")
+
+        # Per-symbol fallback for any not covered by batch fetch.
+        for symbol in remaining:
+            try:
                 df = self.fetch_historical_data(symbol, start_date=fetch_start)
                 if df is not None and not df.empty:
                     db.insert_price_data(df, symbol)
@@ -480,10 +594,13 @@ class MarketDataCollector:
             except Exception as exc:
                 logger.error(f"Failed to update {symbol}: {exc}")
                 failed_symbols += 1
+
         logger.info(
-            "Daily data update summary: "
-            f"symbols={len(symbols)} updated={updated_symbols} "
-            f"skipped_fresh={skipped_fresh} failed={failed_symbols}"
+            "Daily data update summary: symbols=%s updated=%s skipped_fresh=%s failed=%s",
+            len(symbols),
+            updated_symbols,
+            skipped_fresh,
+            failed_symbols,
         )
 
     def backfill_historical_data(self, symbols: list[str], start_date: str = "2020-01-01") -> None:
