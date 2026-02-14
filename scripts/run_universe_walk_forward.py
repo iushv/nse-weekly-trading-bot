@@ -40,19 +40,22 @@ def main() -> int:
     if not universe:
         raise SystemExit(f"Universe file had no symbols: {uni_path}")
 
-    placeholders = ",".join(["?"] * len(universe))
+    sorted_uni = sorted(universe)
+    placeholders = ",".join([f":s{i}" for i in range(len(sorted_uni))])
     q = f"""
     SELECT symbol, date, open, high, low, close, volume
     FROM price_data
-    WHERE date >= DATE(?) AND date <= DATE(?)
+    WHERE date >= DATE(:min_date) AND date <= DATE(:max_date)
       AND symbol IN ({placeholders})
     ORDER BY date, symbol
     """
 
     # Pull sufficient history for warmup in early windows.
     min_date = "2023-01-01"
-    params = [min_date, args.end, *sorted(universe)]
-    md = pd.read_sql(q, db.engine, params=params)
+    bind = {"min_date": min_date, "max_date": args.end}
+    for i, sym in enumerate(sorted_uni):
+        bind[f"s{i}"] = sym
+    md = pd.read_sql(q, db.engine, params=bind)
 
     strategy = AdaptiveTrendFollowingStrategy(log_signals=False)
     wfa = WalkForwardAnalysis(train_period_months=int(args.train_months), test_period_months=int(args.test_months))
