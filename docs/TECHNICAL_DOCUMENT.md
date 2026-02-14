@@ -3,8 +3,8 @@
 **Project**: new-trading-bot
 **Target Market**: NSE (National Stock Exchange of India) via Groww broker
 **Strategy Class**: Adaptive trend-following (weekly timeframe)
-**Status**: Paper-run phase (3/4 anchor robustness validated)
-**Date**: 2026-02-13
+**Status**: Universe pivot validation (Midcap150 candidate)
+**Date**: 2026-02-14
 
 ---
 
@@ -537,3 +537,18 @@ Evaluating a trend-following strategy (30-45% win rate, holds winners) with mome
 ### 9.5 Regime Alignment Must Be Canonical
 
 Having strategy-level regime gates that contradicted the orchestrator's regime assessment caused silent failures. Single source of truth for regime (orchestrator computes, strategies consume) eliminated an entire class of bugs.
+
+
+---
+
+## Midcap 150 Pivot Results (Key Findings)
+
+- Same frozen Adaptive Trend parameters that produced near-zero edge on the large-cap universe produced strong results on Midcap150.
+- Walk-forward sizing matters: 2-month test windows are too short for a 2-6 week hold system.
+
+**Artifacts (primary):**
+- Midcap150 walk-forward 3x3: `reports/backtests/universe_walk_forward_nifty_midcap150_3x3_20240101_20260211_20260214_065139.json`
+
+**Operational switch (paper-run):**
+- Use `UNIVERSE_FILE=data/universe/nifty_midcap150.txt` for deterministic Midcap150 universe.
+- Paper-run readiness is now tracked per-universe using `run_context.universe_tag` embedded in audit/promotion artifacts.

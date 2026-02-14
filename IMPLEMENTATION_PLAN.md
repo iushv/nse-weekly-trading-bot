@@ -700,3 +700,17 @@ This section tracks major implemented experiment rounds that did not improve pro
 > Full file inventory with line estimates and recommended config: [`PHASE9_SPEC.md`](PHASE9_SPEC.md#file-manifest)
 >
 > 6 new files, 8 modified files. No existing strategies are removed.
+
+
+## Midcap 150 Universe Pivot (Decision)
+- Baseline (Nifty 50-ish universe, 6-month continuous): near-zero edge
+  - Artifact: `reports/backtests/adaptive_continuous_6m_20250801_20260212_20260214_054821.json`
+  - Metrics: return `+0.30%`, Sharpe `0.22`, PF `1.05`, trades `41`, max DD `-6.73%`
+- Midcap 150 (same frozen strategy parameters, 6-month continuous): strong edge
+  - Metrics observed: return `+7.54%`, Sharpe `1.42`, PF `1.94`, trades `63`, max DD `-4.52%`
+- Midcap 150 walk-forward (3m train / 3m test) to match hold period:
+  - Artifact: `reports/backtests/universe_walk_forward_nifty_midcap150_3x3_20240101_20260211_20260214_065139.json`
+  - Summary: profitable windows `4/7`, avg return `+0.90%` (note: 1 window had 0 trades), avg Sharpe `0.63`
+- Decision: treat Midcap 150 as the active paper-run universe candidate.
+  - Switch via `UNIVERSE_FILE=data/universe/nifty_midcap150.txt` (or regenerate file with `scripts/update_universe_midcap150.py`).
+  - Paper-run streak must be tracked per-universe (implemented via `run_context.universe_tag`).
