@@ -16,6 +16,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--audit-dir", default="reports/audits", help="Directory with weekly_audit_*.json files.")
     parser.add_argument("--promotion-dir", default="reports/promotion", help="Directory with promotion bundle folders.")
     parser.add_argument("--required-weeks", type=int, default=4, help="Required consecutive ready weeks.")
+    parser.add_argument("--universe-tag", default="", help="Only count checkpoints matching this universe tag (from artifacts).")
     parser.add_argument(
         "--require-promotion-bundle",
         action="store_true",
@@ -66,6 +67,7 @@ def main() -> int:
     result = compute_paper_run_status(
         weekly_records=weekly_records,
         promotion_records=promotion_records,
+        universe_tag=args.universe_tag.strip() or None,
         required_weeks=args.required_weeks,
         require_promotion_bundle=args.require_promotion_bundle,
     )

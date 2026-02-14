@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from trading_bot.monitoring.run_context import build_run_context
 
 def ensure_dir(path: str | Path) -> Path:
     directory = Path(path)
@@ -30,6 +31,7 @@ def write_weekly_audit_artifact(
     output_dir: str | Path = "reports/audits",
     prefix: str = "weekly_audit",
 ) -> Path:
+    result.setdefault("run_context", build_run_context())
     directory = ensure_dir(output_dir)
     name = f"{prefix}_{timestamp_slug()}.json"
     return write_json(directory / name, result)
@@ -42,6 +44,10 @@ def write_promotion_bundle(
     summary: dict[str, Any],
     output_dir: str | Path = "reports/promotion",
 ) -> Path:
+    ctx = build_run_context()
+    preflight.setdefault("run_context", ctx)
+    weekly_audit.setdefault("run_context", ctx)
+    summary.setdefault("run_context", ctx)
     base = ensure_dir(output_dir) / f"promotion_{timestamp_slug()}"
     ensure_dir(base)
     write_json(base / "preflight.json", preflight)

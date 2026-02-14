@@ -22,6 +22,12 @@ def _parse_date(value: Any) -> date | None:
     return None
 
 
+def _universe_tag(record: dict[str, Any]) -> str | None:
+    ctx = record.get("run_context") if isinstance(record.get("run_context"), dict) else {}
+    tag = ctx.get("universe_tag") if isinstance(ctx, dict) else None
+    return str(tag) if tag else None
+
+
 def _load_json(path: Path) -> dict[str, Any] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -132,6 +138,7 @@ def _calculate_trailing_ready_streak(weekly_records: list[dict[str, Any]]) -> in
 
 def compute_paper_run_status(
     *,
+    universe_tag: str | None = None,
     weekly_records: list[dict[str, Any]],
     promotion_records: list[dict[str, Any]],
     required_weeks: int = 4,
@@ -141,6 +148,8 @@ def compute_paper_run_status(
         raise ValueError("required_weeks must be greater than 0")
 
     source_records = promotion_records if require_promotion_bundle else (promotion_records or weekly_records)
+    if universe_tag:
+        source_records = [r for r in source_records if str(r.get("universe_tag") or "").strip() == universe_tag]
     grouped = _group_latest_by_week(source_records)
     streak = _calculate_trailing_ready_streak(grouped)
 
