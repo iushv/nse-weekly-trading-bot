@@ -121,3 +121,25 @@ Windows long-running PC:
 ## Disclaimer
 
 Educational project. Trading involves risk. Validate strategy behavior extensively in paper mode before live deployment.
+
+
+## Midcap 150 Universe (Experiment)
+
+1) Fetch the latest Nifty Midcap 150 constituents into a local universe file:
+```bash
+python scripts/update_universe_midcap150.py --out data/universe/nifty_midcap150.txt
+```
+
+2) Backfill history for Midcap 150 (yfinance default):
+```bash
+python scripts/backfill_data.py --universe midcap150 --limit 150 --start-date 2023-01-01
+```
+
+3) Run a continuous backtest restricted to that universe:
+```bash
+python scripts/run_universe_backtest.py --start 2025-08-01 --end 2026-02-12 --universe-file data/universe/nifty_midcap150.txt
+```
+
+For live/paper runtime, you can also set:
+- `TRADING_UNIVERSE=midcap150` (fetches list online + uses it in universe bootstrap)
+- or `UNIVERSE_FILE=data/universe/nifty_midcap150.txt` (offline deterministic universe)

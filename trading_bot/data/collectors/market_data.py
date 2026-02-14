@@ -43,11 +43,23 @@ class MarketDataCollector:
         self.cache_dir = Path("data/cache")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.nifty_cache_path = self.cache_dir / "nifty500_symbols.json"
+        self.midcap_cache_path = self.cache_dir / "nifty_midcap150_symbols.json"
         self._groww_init_attempted = False
 
     @staticmethod
     def _clean_symbol(symbol: str) -> str:
         return symbol.replace(".NS", "").strip().upper()
+
+    @staticmethod
+    def _normalize_yfinance_symbol(symbol: str) -> str:
+        s = str(symbol or "").strip()
+        if not s:
+            return s
+        if s.startswith("^"):
+            return s
+        if s.endswith(".NS") or "." in s:
+            return s
+        return f"{s}.NS"
 
     def _init_groww_client(self) -> None:
         self._groww_init_attempted = True
@@ -132,23 +144,23 @@ class MarketDataCollector:
                     logger.error(f"Request failed after {retries} attempts for {url}: {exc}")
         raise RuntimeError(f"Failed to fetch {url}") from last_exc
 
-    def _load_cached_nifty_symbols(self) -> list[str]:
-        if not self.nifty_cache_path.exists():
+    def _load_cached_symbols(self, path: Path) -> list[str]:
+        if not path.exists():
             return []
         try:
-            payload = json.loads(self.nifty_cache_path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8"))
             symbols = payload.get("symbols", [])
             if isinstance(symbols, list) and symbols:
-                logger.info(f"Loaded {len(symbols)} symbols from local cache")
+                logger.info(f"Loaded {len(symbols)} symbols from local cache: {path}")
                 return symbols
         except Exception as exc:
             logger.warning(f"Failed to read Nifty cache: {exc}")
         return []
 
-    def _save_cached_nifty_symbols(self, symbols: list[str]) -> None:
+    def _save_cached_symbols(self, path: Path, symbols: list[str]) -> None:
         try:
             payload = {"updated_at": datetime.utcnow().isoformat() + "Z", "symbols": symbols}
-            self.nifty_cache_path.write_text(json.dumps(payload), encoding="utf-8")
+            path.write_text(json.dumps(payload), encoding="utf-8")
         except Exception as exc:
             logger.warning(f"Failed to write Nifty cache: {exc}")
 
@@ -159,16 +171,42 @@ class MarketDataCollector:
             df = pd.read_csv(StringIO(response.text))
             symbols = [f"{sym}.NS" for sym in df["Symbol"].dropna().tolist()]
             self.nifty_500_symbols = symbols
-            self._save_cached_nifty_symbols(symbols)
+            self._save_cached_symbols(self.nifty_cache_path, symbols)
             logger.info(f"Loaded {len(symbols)} Nifty 500 symbols")
             return symbols
         except Exception as exc:
             logger.warning(f"Error fetching Nifty 500 list: {exc}. Checking local cache/fallback.")
-            cached = self._load_cached_nifty_symbols()
+            cached = self._load_cached_symbols(self.nifty_cache_path)
             if cached:
                 self.nifty_500_symbols = cached
                 return cached
             return self._get_fallback_symbols()
+    def get_nifty_midcap_150_list(self) -> list[str]:
+        """Fetch Nifty Midcap 150 constituent list (Yahoo symbols, ".NS" suffix)."""
+        try:
+            url = "https://www1.nseindia.com/content/indices/ind_niftymidcap150list.csv"
+            response = self._request_with_retries(url=url)
+            df = pd.read_csv(StringIO(response.text))
+            col = None
+            for candidate in ("Symbol", "SYMBOL", "symbol"):
+                if candidate in df.columns:
+                    col = candidate
+                    break
+            if col is None:
+                # Fall back to first column if NSE changes headers.
+                col = str(df.columns[0])
+            symbols = [f"{sym}.NS" for sym in df[col].dropna().astype(str).tolist()]
+            symbols = [s for s in symbols if s and s != "nan.NS"]
+            self._save_cached_symbols(self.midcap_cache_path, symbols)
+            logger.info(f"Loaded {len(symbols)} Nifty Midcap 150 symbols")
+            return symbols
+        except Exception as exc:
+            logger.warning(f"Error fetching Midcap 150 list: {exc}. Checking local cache/fallback.")
+            cached = self._load_cached_symbols(self.midcap_cache_path)
+            if cached:
+                return cached
+            return self._get_fallback_symbols()
+
 
     def _get_fallback_symbols(self) -> list[str]:
         return [
@@ -248,7 +286,8 @@ class MarketDataCollector:
     ) -> pd.DataFrame | None:
         for attempt in range(1, 4):
             try:
-                ticker = yf.Ticker(symbol)
+                yf_symbol = self._normalize_yfinance_symbol(symbol)
+                ticker = yf.Ticker(yf_symbol)
                 df = ticker.history(start=start_date, end=end_date)
                 if df.empty:
                     raise RuntimeError("Empty dataframe from yfinance ticker.history")
@@ -265,8 +304,9 @@ class MarketDataCollector:
                     logger.warning(f"Primary yfinance fetch failed for {symbol}: {exc}. Trying download fallback.")
 
         try:
+            yf_symbol = self._normalize_yfinance_symbol(symbol)
             df = yf.download(
-                symbol,
+                yf_symbol,
                 start=start_date,
                 end=end_date,
                 interval="1d",
@@ -392,7 +432,8 @@ class MarketDataCollector:
         for symbol in symbols:
             for attempt in range(1, 3):
                 try:
-                    ticker = yf.Ticker(symbol)
+                    yf_symbol = self._normalize_yfinance_symbol(symbol)
+                    ticker = yf.Ticker(yf_symbol)
                     info = ticker.info
                     market_cap = info.get("marketCap", 0) / 10000000  # crores
                     avg_volume = info.get("averageVolume", 0)
@@ -416,7 +457,6 @@ class MarketDataCollector:
 
         logger.info(f"Filtered to {len(filtered)} liquid stocks")
         return filtered
-
     def update_daily_data(self, symbols: list[str]) -> None:
         today = datetime.now().date()
         fetch_start = today - timedelta(days=3)

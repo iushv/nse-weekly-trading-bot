@@ -209,6 +209,20 @@ class TradingBot:
 
     def _initialize_universe(self) -> list[str]:
         local_only = self.simulation_mode or os.getenv("USE_LOCAL_UNIVERSE", "0") == "1"
+        universe_file = os.getenv("UNIVERSE_FILE", "").strip()
+        if universe_file:
+            try:
+                path = Path(universe_file)
+                raw = path.read_text(encoding="utf-8").splitlines()
+                symbols = [line.strip() for line in raw if line.strip() and not line.strip().startswith("#")]
+                symbols = [s.replace(".NS", "").upper() for s in symbols]
+                if symbols:
+                    logger.info(f"Using UNIVERSE_FILE universe: {len(symbols)} symbols")
+                    return symbols
+            except Exception as exc:
+                logger.warning(f"Failed loading UNIVERSE_FILE={universe_file}: {exc}")
+
+        trading_universe = (Config.TRADING_UNIVERSE or os.getenv("TRADING_UNIVERSE", "")).strip().lower()
         if local_only:
             try:
                 local_df = pd.read_sql(
@@ -223,7 +237,10 @@ class TradingBot:
                 logger.warning(f"Failed loading local universe: {exc}")
 
         try:
-            symbols = self.data_collector.get_nifty_500_list()
+            if trading_universe in {"midcap150", "niftymidcap150"}:
+                symbols = self.data_collector.get_nifty_midcap_150_list()
+            else:
+                symbols = self.data_collector.get_nifty_500_list()
             universe = self.data_collector.filter_liquid_stocks(symbols[:100])
             if universe:
                 return universe

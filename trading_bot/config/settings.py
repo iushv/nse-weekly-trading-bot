@@ -474,6 +474,7 @@ class Config:
     NIFTY_500_URL = "https://www1.nseindia.com/content/indices/ind_nifty500list.csv"
     MONEYCONTROL_BASE_URL = "https://www.moneycontrol.com"
     MARKET_DATA_PROVIDER = os.getenv("MARKET_DATA_PROVIDER", "auto").strip().lower()
+    TRADING_UNIVERSE = os.getenv("TRADING_UNIVERSE", "").strip().lower()
     GROWW_HISTORICAL_EXCHANGE = os.getenv("GROWW_HISTORICAL_EXCHANGE", "NSE").strip().upper()
     GROWW_HISTORICAL_SEGMENT = os.getenv("GROWW_HISTORICAL_SEGMENT", "CASH").strip().upper()
     GROWW_HISTORICAL_INTERVAL = os.getenv("GROWW_HISTORICAL_INTERVAL", "1day").strip().lower()

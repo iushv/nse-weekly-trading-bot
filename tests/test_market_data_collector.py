@@ -79,3 +79,33 @@ def test_update_daily_data_fetches_stale_symbols(monkeypatch):
 
     assert fetch_calls["count"] == 1
     assert inserted == ["RELIANCE.NS"]
+
+
+def test_get_nifty_midcap_150_list_parses_symbols(monkeypatch, tmp_path):
+    collector = MarketDataCollector()
+    collector.midcap_cache_path = tmp_path / "midcap.json"
+
+    csv_text = "Symbol,Company Name\nABC,ABC LTD\nXYZ,XYZ LTD\n"
+
+    class FakeResp:
+        def __init__(self, text: str):
+            self.text = text
+
+    monkeypatch.setattr(collector, "_request_with_retries", lambda url: FakeResp(csv_text))
+
+    symbols = collector.get_nifty_midcap_150_list()
+    assert symbols == ["ABC.NS", "XYZ.NS"]
+
+
+def test_get_nifty_midcap_150_list_falls_back_to_cache(monkeypatch, tmp_path):
+    collector = MarketDataCollector()
+    collector.midcap_cache_path = tmp_path / "midcap.json"
+    collector.midcap_cache_path.write_text('{"updated_at":"now","symbols":["AAA.NS","BBB.NS"]}', encoding="utf-8")
+
+    def fail_request(**_kwargs):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(collector, "_request_with_retries", fail_request)
+
+    symbols = collector.get_nifty_midcap_150_list()
+    assert symbols == ["AAA.NS", "BBB.NS"]

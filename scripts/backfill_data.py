@@ -11,6 +11,12 @@ def main() -> None:
     parser.add_argument("--start-date", default="2022-01-01")
     parser.add_argument("--limit", type=int, default=30)
     parser.add_argument(
+        "--universe",
+        choices=["nifty500", "midcap150", "fallback"],
+        default="nifty500",
+        help="Universe to backfill when --symbols is not provided.",
+    )
+    parser.add_argument(
         "--provider",
         choices=["auto", "yfinance", "groww"],
         default=None,
@@ -33,8 +39,10 @@ def main() -> None:
 
     if args.symbols.strip():
         symbols = [item.strip() for item in args.symbols.split(",") if item.strip()]
-    elif args.use_fallback_universe:
+    elif args.use_fallback_universe or args.universe == "fallback":
         symbols = collector._get_fallback_symbols()
+    elif args.universe == "midcap150":
+        symbols = collector.get_nifty_midcap_150_list()
     else:
         symbols = collector.get_nifty_500_list()
 
