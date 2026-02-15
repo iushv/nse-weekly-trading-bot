@@ -632,7 +632,7 @@ class MarketDataCollector:
 
         if not stale_symbols:
             logger.info(
-                "Daily data update summary: symbols=%s updated=%s skipped_fresh=%s failed=%s",
+                "Daily data update summary: symbols={} updated={} skipped_fresh={} failed={}",
                 len(symbols),
                 0,
                 skipped_fresh,
@@ -674,7 +674,7 @@ class MarketDataCollector:
                 failed_symbols += 1
 
         logger.info(
-            "Daily data update summary: symbols=%s updated=%s skipped_fresh=%s failed=%s",
+            "Daily data update summary: symbols={} updated={} skipped_fresh={} failed={}",
             len(symbols),
             updated_symbols,
             skipped_fresh,
