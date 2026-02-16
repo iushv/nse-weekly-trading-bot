@@ -615,7 +615,7 @@ class MarketDataCollector:
     def update_daily_data(self, symbols: list[str]) -> None:
         today = datetime.now().date()
         fetch_start = today - timedelta(days=3)
-        freshness_threshold = today - timedelta(days=3)
+        freshness_threshold = today - timedelta(days=1)
 
         stale_symbols: list[str] = []
         skipped_fresh = 0
