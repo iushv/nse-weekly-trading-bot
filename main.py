@@ -1831,11 +1831,17 @@ class TradingBot:
             if recovered:
                 logger.info(f"Startup auto-resume recovered routines: {recovered}")
 
+        last_heartbeat = time.time()
         while True:
             try:
                 schedule.run_pending()
                 if Config.AUTO_RESUME_ENABLED:
                     self._run_recovery_cycle()
+                
+                # Watchdog: log heartbeat every minute to prove scheduler is alive
+                if time.time() - last_heartbeat > 60:
+                    self._write_heartbeat("scheduler_heartbeat")
+                    last_heartbeat = time.time()
             except Exception as exc:
                 logger.error(f"Scheduler loop error: {exc}")
                 self._write_heartbeat("scheduler_loop_error")
