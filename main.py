@@ -10,6 +10,8 @@ from typing import Any
 
 import pandas as pd
 import schedule
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 from loguru import logger
 from sqlalchemy import text
 
@@ -1811,21 +1813,35 @@ class TradingBot:
                 self._execute_exit(symbol, float(row["close"]), "EMERGENCY_STOP")
 
     def run(self) -> None:
-        schedule.every().day.at("08:00").do(self.pre_market_routine)
-        schedule.every().day.at("09:15").do(self.market_open_routine)
-        schedule.every().day.at("15:30").do(self.market_close_routine)
+        # Use APScheduler instead of schedule library (more reliable on Windows)
+        scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
+        
+        # Daily routines
+        scheduler.add_job(self.pre_market_routine, CronTrigger(hour=8, minute=0), id="pre_market")
+        scheduler.add_job(self.market_open_routine, CronTrigger(hour=9, minute=15), id="market_open")
+        scheduler.add_job(self.market_close_routine, CronTrigger(hour=15, minute=30), id="market_close")
+        
+        # Intraday monitoring every 30 mins
         for hour in range(9, 16):
-            for minute in ["00", "30"]:
-                schedule.every().day.at(f"{hour:02d}:{minute}").do(self.intraday_monitoring)
+            for minute in [0, 30]:
+                scheduler.add_job(self.intraday_monitoring, CronTrigger(hour=hour, minute=minute), 
+                               id=f"intraday_{hour:02d}{minute:02d}")
+        
         if not self.paper_mode:
             for t in ["10:05", "12:05", "14:05", "16:05"]:
-                schedule.every().day.at(t).do(self.reconciliation_routine)
-        schedule.every().sunday.at("18:10").do(self.weekly_audit_routine)
-        schedule.every().sunday.at("18:20").do(self.weekly_audit_trend_routine)
-        schedule.every().sunday.at("18:25").do(self.paper_run_status_routine)
-        schedule.every().sunday.at("18:30").do(self.retention_rotation_routine)
-
-        logger.info("Scheduler started")
+                hour, minute = t.split(":")
+                scheduler.add_job(self.reconciliation_routine, CronTrigger(hour=int(hour), minute=int(minute)),
+                                id=f"reconcile_{t}")
+        
+        # Weekly routines (Sunday)
+        scheduler.add_job(self.weekly_audit_routine, CronTrigger(day_of_week=6, hour=18, minute=10), id="weekly_audit")
+        scheduler.add_job(self.weekly_audit_trend_routine, CronTrigger(day_of_week=6, hour=18, minute=20), id="weekly_audit_trend")
+        scheduler.add_job(self.paper_run_status_routine, CronTrigger(day_of_week=6, hour=18, minute=25), id="paper_run_status")
+        scheduler.add_job(self.retention_rotation_routine, CronTrigger(day_of_week=6, hour=18, minute=30), id="retention_rotation")
+        
+        scheduler.start()
+        logger.info("APScheduler started")
+        
         if Config.AUTO_RESUME_ENABLED:
             recovered = self._run_recovery_cycle(force=True)
             if recovered:
@@ -1834,7 +1850,6 @@ class TradingBot:
         last_heartbeat = time.time()
         while True:
             try:
-                schedule.run_pending()
                 if Config.AUTO_RESUME_ENABLED:
                     self._run_recovery_cycle()
                 
