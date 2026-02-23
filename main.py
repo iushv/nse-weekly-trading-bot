@@ -4,12 +4,11 @@ import argparse
 import json
 import os
 import time
-from datetime import date, datetime, time as dt_time
+from datetime import date, datetime, time as dt_time, timedelta
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
-import schedule
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from loguru import logger
@@ -18,6 +17,7 @@ from sqlalchemy import text
 from trading_bot.config.settings import Config
 from trading_bot.data.collectors.alternative_data import AlternativeDataScraper
 from trading_bot.data.collectors.market_data import MarketDataCollector
+from trading_bot.data.processors.regime import compute_market_regime
 from trading_bot.data.storage.database import db
 from trading_bot.data.storage.feature_store import FeatureStore
 from trading_bot.execution.broker_interface import BrokerInterface
@@ -126,14 +126,23 @@ class TradingBot:
                 weekly_rsi_period=Config.ADAPTIVE_TREND_WEEKLY_RSI_PERIOD,
                 min_weekly_roc=Config.ADAPTIVE_TREND_MIN_WEEKLY_ROC,
                 max_weekly_roc=Config.ADAPTIVE_TREND_MAX_WEEKLY_ROC,
+                daily_rsi_min=Config.ADAPTIVE_DAILY_RSI_MIN,
+                daily_rsi_max=Config.ADAPTIVE_DAILY_RSI_MAX,
+                min_volume_ratio=Config.ADAPTIVE_MIN_VOLUME_RATIO,
                 min_weekly_ema_spread_pct=Config.ADAPTIVE_TREND_MIN_WEEKLY_EMA_SPREAD_PCT,
                 min_trend_consistency=Config.ADAPTIVE_TREND_MIN_TREND_CONSISTENCY,
                 min_expected_r_mult=Config.ADAPTIVE_TREND_MIN_EXPECTED_R_MULT,
                 stop_atr_mult=Config.ADAPTIVE_TREND_STOP_ATR_MULT,
                 profit_protect_pct=Config.ADAPTIVE_TREND_PROFIT_PROTECT_PCT,
                 profit_trail_atr_mult=Config.ADAPTIVE_TREND_PROFIT_TRAIL_ATR_MULT,
+                trail_tier2_gain=Config.ADAPTIVE_TREND_TRAIL_TIER2_GAIN,
+                trail_tier2_mult=Config.ADAPTIVE_TREND_TRAIL_TIER2_MULT,
+                trail_tier3_gain=Config.ADAPTIVE_TREND_TRAIL_TIER3_GAIN,
+                trail_tier3_mult=Config.ADAPTIVE_TREND_TRAIL_TIER3_MULT,
                 breakeven_gain_pct=Config.ADAPTIVE_TREND_BREAKEVEN_GAIN_PCT,
                 breakeven_buffer_pct=Config.ADAPTIVE_TREND_BREAKEVEN_BUFFER_PCT,
+                max_weekly_atr_pct=Config.ADAPTIVE_TREND_MAX_WEEKLY_ATR_PCT,
+                transaction_cost_pct=Config.TOTAL_COST_PER_TRADE,
                 max_positions=Config.ADAPTIVE_TREND_MAX_POSITIONS,
                 max_new_per_week=Config.ADAPTIVE_TREND_MAX_NEW_PER_WEEK,
                 min_hold_days=Config.ADAPTIVE_TREND_MIN_HOLD_DAYS,
@@ -185,6 +194,7 @@ class TradingBot:
         self._last_recovery_check_at = 0.0
         self._restore_portfolio_state_from_db()
         self._restore_open_positions_from_db()
+        self.risk_manager.reconstruct_realized_pnl(db.engine, self._now().date())
 
         self.universe = self._initialize_universe()
 
@@ -264,6 +274,97 @@ class TradingBot:
 
     def _today_str(self) -> str:
         return str(self._now().date())
+
+    @staticmethod
+    def _latest_trading_day(anchor: date) -> date:
+        current = anchor
+        while current.weekday() >= 5:
+            current -= timedelta(days=1)
+        return current
+
+    @classmethod
+    def _previous_trading_day(cls, anchor: date) -> date:
+        return cls._latest_trading_day(anchor - timedelta(days=1))
+
+    @staticmethod
+    def _normalize_symbol(symbol: str) -> str:
+        return str(symbol).replace(".NS", "").strip().upper()
+
+    def _missing_universe_symbols_for_date(self, target_date: date) -> list[str]:
+        universe_symbols = sorted({self._normalize_symbol(symbol) for symbol in self.universe if str(symbol).strip()})
+        if not universe_symbols:
+            return []
+
+        df = pd.read_sql(
+            """
+            SELECT DISTINCT symbol
+            FROM price_data
+            WHERE date = :target_date
+              AND close IS NOT NULL
+            """,
+            db.engine,
+            params={"target_date": str(target_date)},
+        )
+        available = {self._normalize_symbol(symbol) for symbol in df.get("symbol", pd.Series(dtype="object")).tolist()}
+        return [symbol for symbol in universe_symbols if symbol not in available]
+
+    def _attempt_data_repair_for_date(self, target_date: date, reason: str) -> dict[str, Any]:
+        if self.simulation_mode:
+            return {"skipped": True, "reason": "simulation_mode", "target_date": str(target_date)}
+
+        missing_before = self._missing_universe_symbols_for_date(target_date)
+        if not missing_before:
+            return {
+                "skipped": True,
+                "reason": "no_missing_symbols",
+                "target_date": str(target_date),
+                "missing_before": 0,
+                "missing_after": 0,
+            }
+
+        logger.warning(
+            "Data coverage gap detected for {}: missing_symbols={}",
+            target_date,
+            len(missing_before),
+        )
+        refresh = self.data_collector.update_daily_data(
+            missing_before,
+            required_latest_date=target_date,
+        )
+        missing_after = self._missing_universe_symbols_for_date(target_date)
+        repaired_count = max(0, len(missing_before) - len(missing_after))
+
+        metadata = {
+            "target_date": str(target_date),
+            "reason": reason,
+            "missing_before": len(missing_before),
+            "missing_after": len(missing_after),
+            "repaired_count": repaired_count,
+            "sample_missing_after": missing_after[:20],
+            "refresh_summary": refresh,
+        }
+        level = "INFO" if not missing_after else "WARNING"
+        self._insert_system_log(level, "data_repair", "universe_data_repair", metadata=metadata)
+
+        if missing_after:
+            logger.warning(
+                "Data repair incomplete for {}: repaired={} remaining_missing={}",
+                target_date,
+                repaired_count,
+                len(missing_after),
+            )
+            self.telegram.send_alert(
+                "WARNING",
+                (
+                    f"Data repair incomplete for {target_date}\n"
+                    f"Repaired: {repaired_count}\n"
+                    f"Remaining missing: {len(missing_after)}"
+                ),
+            )
+        else:
+            logger.info("Data repair complete for {}: repaired={}", target_date, repaired_count)
+
+        return metadata
 
     def set_simulation_date(self, dt: datetime) -> None:
         self.simulation_mode = True
@@ -477,7 +578,18 @@ class TradingBot:
         try:
             open_df = pd.read_sql(
                 """
-                SELECT order_id, symbol, strategy, quantity, entry_price, entry_date, stop_loss, target
+                SELECT
+                    order_id,
+                    symbol,
+                    strategy,
+                    quantity,
+                    entry_price,
+                    entry_date,
+                    stop_loss,
+                    target,
+                    highest_close,
+                    lowest_close,
+                    weekly_atr
                 FROM trades
                 WHERE status = 'OPEN'
                 ORDER BY entry_date ASC
@@ -505,6 +617,12 @@ class TradingBot:
                     entry_date = pd.to_datetime(entry_date_raw).to_pydatetime()
                 except Exception:
                     entry_date = self._now()
+                highest_raw = row.get("highest_close")
+                lowest_raw = row.get("lowest_close")
+                weekly_atr_raw = row.get("weekly_atr")
+                highest_close = float(highest_raw) if pd.notna(highest_raw) else entry_price
+                lowest_close = float(lowest_raw) if pd.notna(lowest_raw) else entry_price
+                weekly_atr = float(weekly_atr_raw) if pd.notna(weekly_atr_raw) else 0.0
                 self.positions[symbol] = {
                     "symbol": symbol,
                     "strategy": str(row.get("strategy", "unknown")),
@@ -513,9 +631,9 @@ class TradingBot:
                     "quantity": qty,
                     "stop_loss": float(row.get("stop_loss", entry_price * 0.95)),
                     "target": float(row.get("target", entry_price * 1.08)),
-                    "highest_close": entry_price,
-                    "lowest_close": entry_price,
-                    "weekly_atr": 0.0,
+                    "highest_close": highest_close if highest_close > 0 else entry_price,
+                    "lowest_close": lowest_close if lowest_close > 0 else entry_price,
+                    "weekly_atr": weekly_atr if weekly_atr > 0 else 0.0,
                     "metadata": {},
                     "days_held": max(0, (self._now() - entry_date).days),
                     "order_id": str(row.get("order_id", "")),
@@ -525,6 +643,42 @@ class TradingBot:
                 continue
         if restored > 0:
             logger.info(f"Restored {restored} open position(s) from local DB state")
+        try:
+            reconstructed_cash = self._reconstruct_cash_from_trade_ledger()
+            if abs(reconstructed_cash - self.cash) > 1.0:
+                logger.warning(
+                    "Cash discrepancy on restore: snapshot={:.2f} reconstructed={:.2f}",
+                    self.cash,
+                    reconstructed_cash,
+                )
+            self.cash = reconstructed_cash
+        except Exception as exc:
+            logger.warning(f"Cash reconstruction skipped: {exc}")
+        try:
+            self._update_portfolio_value()
+        except Exception as exc:
+            logger.warning(f"Portfolio value refresh skipped: {exc}")
+
+    def _reconstruct_cash_from_trade_ledger(self) -> float:
+        ledger = pd.read_sql(
+            "SELECT entry_price, exit_price, quantity, status FROM trades",
+            db.engine,
+        )
+        if ledger.empty:
+            return float(Config.STARTING_CAPITAL)
+
+        frame = ledger.copy()
+        frame["entry_price"] = pd.to_numeric(frame["entry_price"], errors="coerce").fillna(0.0)
+        frame["exit_price"] = pd.to_numeric(frame["exit_price"], errors="coerce").fillna(0.0)
+        frame["quantity"] = pd.to_numeric(frame["quantity"], errors="coerce").fillna(0.0)
+        frame["status"] = frame["status"].astype(str).str.upper().str.strip()
+
+        entry_costs = (frame["entry_price"] * frame["quantity"] * (1 + Config.COST_PER_SIDE)).sum()
+        closed = frame[(frame["status"] == "CLOSED") & (frame["exit_price"] > 0) & (frame["quantity"] > 0)]
+        exit_proceeds = (closed["exit_price"] * closed["quantity"] * (1 - Config.COST_PER_SIDE)).sum()
+
+        reconstructed = float(Config.STARTING_CAPITAL) - float(entry_costs) + float(exit_proceeds)
+        return float(reconstructed)
 
     def _in_time_window(self, current: dt_time, start_raw: str, end_raw: str, fallback_start: dt_time, fallback_end: dt_time) -> bool:
         start = self._parse_clock_time(start_raw, fallback_start)
@@ -582,6 +736,17 @@ class TradingBot:
             logger.warning(f"Auto-resume running missed market-close routine for {self._today_str()}")
             self.market_close_routine()
             recovered.append("market_close")
+
+        if self._in_time_window(
+            now_clock,
+            "19:45",
+            "22:00",
+            dt_time(19, 45),
+            dt_time(22, 0),
+        ) and not self._routine_completed_today("eod_data_repair"):
+            logger.warning(f"Auto-resume running missed EOD data-repair routine for {self._today_str()}")
+            self.eod_data_repair_routine()
+            recovered.append("eod_data_repair")
 
         return recovered
 
@@ -935,6 +1100,34 @@ class TradingBot:
             return
         logger.info("Running pre-market routine")
 
+        prior_trading_day = self._previous_trading_day(self._now().date())
+        repair = self._attempt_data_repair_for_date(prior_trading_day, reason="pre_market_guard")
+        if int(repair.get("missing_after", 0) or 0) > 0:
+            remaining = int(repair.get("missing_after", 0) or 0)
+            logger.warning(
+                "Blocking pre-market signal generation due incomplete data for {} (remaining_missing={})",
+                prior_trading_day,
+                remaining,
+            )
+            self._insert_system_log(
+                "WARNING",
+                "pre_market_data",
+                "pre_market_blocked_incomplete_data",
+                metadata=repair,
+            )
+            self.pending_signals = []
+            self._persist_pending_signals(self.pending_signals)
+            self.telegram.send_alert(
+                "WARNING",
+                (
+                    f"Pre-market blocked: incomplete data for {prior_trading_day}\n"
+                    f"Remaining missing symbols: {remaining}"
+                ),
+            )
+            self._mark_routine_completed("pre_market")
+            self._write_heartbeat("pre_market_blocked_data_incomplete")
+            return
+
         if self.simulation_mode:
             logger.info("Simulation mode: skipping live alternative data scraping")
         else:
@@ -947,6 +1140,7 @@ class TradingBot:
         regime = self._compute_market_regime(market_data)
 
         all_signals = []
+        scan_diagnostics: dict[str, Any] = {}
         for name, strategy in self.strategies.items():
             strategy_alt_data = alt_data if name == "sector_rotation" else None
             signals = strategy.generate_signals(
@@ -955,6 +1149,9 @@ class TradingBot:
                 market_regime=regime,
             )
             all_signals.extend(signals)
+            strategy_scan_stats = getattr(strategy, "last_scan_stats", None)
+            if isinstance(strategy_scan_stats, dict):
+                scan_diagnostics[name] = self._json_safe(strategy_scan_stats)
 
         in_defensive_mode = bool(
             Config.ADAPTIVE_DEFENSIVE_MODE_ENABLED and not bool(regime.get("is_favorable", True))
@@ -1069,6 +1266,7 @@ class TradingBot:
                     "min_expected_edge_pct": float(min_expected_edge_pct),
                     "max_daily_signals": int(max_daily_signals),
                 },
+                "scan_diagnostics": scan_diagnostics,
             },
         )
 
@@ -1090,111 +1288,7 @@ class TradingBot:
         return float(gross_reward_pct - Config.TOTAL_COST_PER_TRADE)
 
     def _compute_market_regime(self, market_data: pd.DataFrame) -> dict[str, Any]:
-        if market_data.empty:
-            return {
-                "is_favorable": True,
-                "regime_label": "unknown",
-                "trend_up": True,
-                "annualized_volatility": 0.0,
-                "volatility_threshold": float(Config.MOMENTUM_REGIME_MAX_ANNUAL_VOL),
-                "breadth_ratio": 1.0,
-                "breadth_threshold": Config.ADAPTIVE_DEFENSIVE_MIN_BREADTH,
-                "confidence": 0.5,
-                "eligible_symbols": 0,
-                "reason": "empty_market_data",
-            }
-
-        vol_window = max(5, int(Config.MOMENTUM_REGIME_VOL_WINDOW))
-        proxy_sma_period = max(5, int(Config.MOMENTUM_REGIME_SMA_PERIOD))
-        period = max(2, int(Config.ADAPTIVE_DEFENSIVE_BREADTH_SMA_PERIOD))
-        frame = market_data[["symbol", "date", "close"]].copy()
-        frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
-        frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
-        frame = frame.dropna(subset=["symbol", "date", "close"])
-        if frame.empty:
-            return {
-                "is_favorable": True,
-                "regime_label": "unknown",
-                "trend_up": True,
-                "annualized_volatility": 0.0,
-                "volatility_threshold": float(Config.MOMENTUM_REGIME_MAX_ANNUAL_VOL),
-                "breadth_ratio": 1.0,
-                "breadth_threshold": Config.ADAPTIVE_DEFENSIVE_MIN_BREADTH,
-                "confidence": 0.5,
-                "eligible_symbols": 0,
-                "reason": "no_valid_points",
-            }
-
-        frame = frame.sort_values(["symbol", "date"])
-        frame["sma"] = frame.groupby("symbol")["close"].transform(lambda series: series.rolling(period).mean())
-        latest = frame.dropna(subset=["sma"]).groupby("symbol", as_index=False).tail(1)
-        eligible = int(len(latest))
-        min_eligible = max(1, int(Config.ADAPTIVE_DEFENSIVE_MIN_ELIGIBLE_SYMBOLS))
-        if eligible < min_eligible:
-            return {
-                "is_favorable": True,
-                "regime_label": "warmup",
-                "trend_up": True,
-                "annualized_volatility": 0.0,
-                "volatility_threshold": float(Config.MOMENTUM_REGIME_MAX_ANNUAL_VOL),
-                "breadth_ratio": 1.0,
-                "breadth_threshold": Config.ADAPTIVE_DEFENSIVE_MIN_BREADTH,
-                "confidence": 0.5,
-                "eligible_symbols": eligible,
-                "reason": "insufficient_symbols",
-            }
-
-        breadth_ratio = float((latest["close"] > latest["sma"]).mean())
-        threshold = float(Config.ADAPTIVE_DEFENSIVE_MIN_BREADTH)
-        close_pivot = frame.pivot_table(index="date", columns="symbol", values="close", aggfunc="last").sort_index()
-        proxy_returns = close_pivot.pct_change(fill_method=None).mean(axis=1, skipna=True).fillna(0.0)
-        proxy = (1.0 + proxy_returns).cumprod() * 100.0
-
-        min_proxy_points = max(proxy_sma_period, vol_window) + 5
-        if len(proxy) < min_proxy_points:
-            trend_up = True
-            latest_vol = 0.0
-            low_vol = True
-            reason = "proxy_warmup"
-        else:
-            proxy_sma = proxy.rolling(proxy_sma_period).mean()
-            ann_vol = proxy_returns.rolling(vol_window).std() * (252**0.5)
-            latest_close = float(proxy.iloc[-1])
-            latest_sma = float(proxy_sma.iloc[-1]) if pd.notna(proxy_sma.iloc[-1]) else latest_close
-            latest_vol = float(ann_vol.iloc[-1]) if pd.notna(ann_vol.iloc[-1]) else 0.0
-            trend_up = latest_close >= (latest_sma * 0.99)
-            low_vol = latest_vol <= float(Config.MOMENTUM_REGIME_MAX_ANNUAL_VOL)
-            reason = "computed"
-
-        is_favorable = bool((breadth_ratio >= threshold) and trend_up and low_vol)
-        if is_favorable:
-            regime_label = "favorable"
-        elif (not trend_up) and (breadth_ratio < (threshold * 0.9)):
-            regime_label = "bearish"
-        elif low_vol and breadth_ratio >= (threshold * 0.8):
-            regime_label = "choppy"
-        else:
-            regime_label = "defensive"
-
-        vol_limit = max(float(Config.MOMENTUM_REGIME_MAX_ANNUAL_VOL), 1e-6)
-        if latest_vol <= vol_limit:
-            vol_score = 1.0
-        else:
-            vol_score = max(0.0, 1.0 - ((latest_vol - vol_limit) / vol_limit))
-        confidence = self._clamp((0.40 * breadth_ratio) + (0.35 * (1.0 if trend_up else 0.0)) + (0.25 * vol_score))
-
-        return {
-            "is_favorable": is_favorable,
-            "regime_label": regime_label,
-            "trend_up": bool(trend_up),
-            "annualized_volatility": float(latest_vol),
-            "volatility_threshold": float(Config.MOMENTUM_REGIME_MAX_ANNUAL_VOL),
-            "breadth_ratio": breadth_ratio,
-            "breadth_threshold": threshold,
-            "confidence": confidence,
-            "eligible_symbols": eligible,
-            "reason": reason,
-        }
+        return compute_market_regime(market_data)
 
     def _compute_market_breadth_regime(self, market_data: pd.DataFrame) -> dict[str, Any]:
         """Backward-compatible wrapper for older callers."""
@@ -1438,7 +1532,24 @@ class TradingBot:
         self._write_heartbeat("market_close_start")
         logger.info("Running market-close routine")
         if not self.simulation_mode:
-            self.data_collector.update_daily_data(self.universe)
+            target_date = self._latest_trading_day(self._now().date())
+            summary = self.data_collector.update_daily_data(
+                self.universe,
+                required_latest_date=target_date,
+            )
+            unresolved = summary.get("unresolved_symbols", [])
+            if isinstance(unresolved, list) and unresolved:
+                self._insert_system_log(
+                    "WARNING",
+                    "market_close_data",
+                    "market_close_data_incomplete",
+                    metadata={
+                        "target_date": str(target_date),
+                        "unresolved_symbols": len(unresolved),
+                        "sample_symbols": unresolved[:20],
+                        "summary": summary,
+                    },
+                )
         self._update_portfolio_value()
         self._save_portfolio_snapshot()
         closed_today = self._get_closed_trades_today()
@@ -1459,6 +1570,20 @@ class TradingBot:
         )
         self._mark_routine_completed("market_close")
         self._write_heartbeat("market_close_complete")
+
+    def eod_data_repair_routine(self) -> dict[str, Any]:
+        self._write_heartbeat("eod_data_repair_start")
+        try:
+            target_date = self._latest_trading_day(self._now().date())
+            result = self._attempt_data_repair_for_date(target_date, reason="eod_repair_guard")
+            self._mark_routine_completed("eod_data_repair")
+            self._write_heartbeat("eod_data_repair_complete")
+            return result
+        except Exception as exc:
+            self._insert_system_log("ERROR", "eod_data_repair", f"EOD data repair failed: {exc}")
+            self.telegram.send_alert("ERROR", f"EOD data repair failed: {exc}")
+            self._write_heartbeat("eod_data_repair_failed")
+            raise
 
     def _execute_entry(self, signal: Signal) -> None:
         if signal.symbol in self.positions:
@@ -1581,12 +1706,26 @@ class TradingBot:
 
             position["days_held"] = (self._now() - position["entry_date"]).days
             current_close = float(current_data["close"])
-            position["highest_close"] = max(float(position.get("highest_close", current_close)), current_close)
-            position["lowest_close"] = min(float(position.get("lowest_close", current_close)), current_close)
+            prev_high = float(position.get("highest_close", current_close))
+            prev_low = float(position.get("lowest_close", current_close))
+            next_high = max(prev_high, current_close)
+            next_low = min(prev_low, current_close)
+            position["highest_close"] = next_high
+            position["lowest_close"] = next_low
+            state_changed = (next_high != prev_high) or (next_low != prev_low)
             if symbol in weekly_ema_cache:
                 ema_short, ema_long = weekly_ema_cache[symbol]
+                prev_ema_short = position.get("current_weekly_ema_short")
+                prev_ema_long = position.get("current_weekly_ema_long")
                 position["current_weekly_ema_short"] = ema_short
                 position["current_weekly_ema_long"] = ema_long
+                state_changed = state_changed or (prev_ema_short != ema_short) or (prev_ema_long != ema_long)
+
+            if state_changed:
+                try:
+                    self._save_trade_to_db(position, status="OPEN")
+                except Exception as exc:
+                    logger.warning(f"Failed to persist position state for {symbol}: {exc}")
 
             strategy = self.strategies.get(position["strategy"].lower().replace(" ", "_"))
             if strategy is None:
@@ -1680,14 +1819,29 @@ class TradingBot:
         return rows
 
     def _load_market_data(self) -> pd.DataFrame:
+        if not self.universe:
+            return pd.DataFrame()
+        symbols = sorted(
+            {
+                self._normalize_symbol(symbol)
+                for symbol in self.universe
+                if str(symbol).strip()
+            }
+        )
+        if not symbols:
+            return pd.DataFrame()
+        placeholders = ",".join(f":s{i}" for i in range(len(symbols)))
         query = """
             SELECT symbol, date, open, high, low, close, volume
             FROM price_data
-            WHERE date >= date(:anchor, '-260 day')
+            WHERE symbol IN ({placeholders})
+            AND date >= date(:anchor, '-260 day')
             AND date <= date(:anchor)
             ORDER BY symbol, date
-        """
-        return pd.read_sql(query, db.engine, params={"anchor": self._today_str()})
+        """.format(placeholders=placeholders)
+        params: dict[str, Any] = {"anchor": self._today_str()}
+        params.update({f"s{i}": symbol for i, symbol in enumerate(symbols)})
+        return pd.read_sql(query, db.engine, params=params)
 
     def _load_alternative_data(self) -> pd.DataFrame:
         query = """
@@ -1712,10 +1866,14 @@ class TradingBot:
         query = """
             INSERT OR REPLACE INTO trades (
                 order_id, symbol, strategy, action, quantity, entry_price, entry_date,
-                exit_price, exit_date, stop_loss, target, pnl, pnl_percent, status, notes
+                exit_price, exit_date, stop_loss, target,
+                highest_close, lowest_close, weekly_atr,
+                pnl, pnl_percent, status, notes
             ) VALUES (
                 :order_id, :symbol, :strategy, :action, :quantity, :entry_price, :entry_date,
-                :exit_price, :exit_date, :stop_loss, :target, :pnl, :pnl_percent, :status, :notes
+                :exit_price, :exit_date, :stop_loss, :target,
+                :highest_close, :lowest_close, :weekly_atr,
+                :pnl, :pnl_percent, :status, :notes
             )
         """
         payload = {
@@ -1730,6 +1888,9 @@ class TradingBot:
             "exit_date": str(trade.get("exit_date")) if trade.get("exit_date") else None,
             "stop_loss": trade.get("stop_loss"),
             "target": trade.get("target"),
+            "highest_close": trade.get("highest_close"),
+            "lowest_close": trade.get("lowest_close"),
+            "weekly_atr": trade.get("weekly_atr"),
             "pnl": trade.get("pnl"),
             "pnl_percent": trade.get("pnl_percent"),
             "status": status,
@@ -1815,33 +1976,43 @@ class TradingBot:
     def run(self) -> None:
         # Use APScheduler instead of schedule library (more reliable on Windows)
         scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
-        
+        weekdays = "mon-fri"
+
         # Daily routines
-        scheduler.add_job(self.pre_market_routine, CronTrigger(hour=8, minute=0), id="pre_market")
-        scheduler.add_job(self.market_open_routine, CronTrigger(hour=9, minute=15), id="market_open")
-        scheduler.add_job(self.market_close_routine, CronTrigger(hour=15, minute=30), id="market_close")
-        
+        scheduler.add_job(self.pre_market_routine, CronTrigger(day_of_week=weekdays, hour=8, minute=0), id="pre_market")
+        scheduler.add_job(self.market_open_routine, CronTrigger(day_of_week=weekdays, hour=9, minute=15), id="market_open")
+        scheduler.add_job(self.market_close_routine, CronTrigger(day_of_week=weekdays, hour=15, minute=30), id="market_close")
+        scheduler.add_job(self.eod_data_repair_routine, CronTrigger(day_of_week=weekdays, hour=20, minute=0), id="eod_data_repair")
+
         # Intraday monitoring every 30 mins
         for hour in range(9, 16):
             for minute in [0, 30]:
-                scheduler.add_job(self.intraday_monitoring, CronTrigger(hour=hour, minute=minute), 
-                               id=f"intraday_{hour:02d}{minute:02d}")
-        
+                if hour == 15 and minute == 30:
+                    continue
+                scheduler.add_job(
+                    self.intraday_monitoring,
+                    CronTrigger(day_of_week=weekdays, hour=hour, minute=minute),
+                    id=f"intraday_{hour:02d}{minute:02d}",
+                )
+
         if not self.paper_mode:
             for t in ["10:05", "12:05", "14:05", "16:05"]:
                 hour, minute = t.split(":")
-                scheduler.add_job(self.reconciliation_routine, CronTrigger(hour=int(hour), minute=int(minute)),
-                                id=f"reconcile_{t}")
-        
+                scheduler.add_job(
+                    self.reconciliation_routine,
+                    CronTrigger(day_of_week=weekdays, hour=int(hour), minute=int(minute)),
+                    id=f"reconcile_{t}",
+                )
+
         # Weekly routines (Sunday)
         scheduler.add_job(self.weekly_audit_routine, CronTrigger(day_of_week=6, hour=18, minute=10), id="weekly_audit")
         scheduler.add_job(self.weekly_audit_trend_routine, CronTrigger(day_of_week=6, hour=18, minute=20), id="weekly_audit_trend")
         scheduler.add_job(self.paper_run_status_routine, CronTrigger(day_of_week=6, hour=18, minute=25), id="paper_run_status")
         scheduler.add_job(self.retention_rotation_routine, CronTrigger(day_of_week=6, hour=18, minute=30), id="retention_rotation")
-        
+
         scheduler.start()
         logger.info("APScheduler started")
-        
+
         if Config.AUTO_RESUME_ENABLED:
             recovered = self._run_recovery_cycle(force=True)
             if recovered:
@@ -1852,7 +2023,7 @@ class TradingBot:
             try:
                 if Config.AUTO_RESUME_ENABLED:
                     self._run_recovery_cycle()
-                
+
                 # Watchdog: log heartbeat every minute to prove scheduler is alive
                 if time.time() - last_heartbeat > 60:
                     self._write_heartbeat("scheduler_heartbeat")

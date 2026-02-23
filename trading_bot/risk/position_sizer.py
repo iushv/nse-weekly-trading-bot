@@ -12,6 +12,9 @@ def size_position(price: float, stop_loss: float, capital: float, cash_available
     shares = int(risk_amount / risk_per_share)
     max_value = capital * Config.MAX_POSITION_SIZE
     shares = min(shares, int(max_value / price))
+    if Config.MAX_LOSS_PER_TRADE > 0:
+        max_loss_shares = int((capital * Config.MAX_LOSS_PER_TRADE) / risk_per_share)
+        shares = min(shares, max_loss_shares)
 
     needed = shares * price * (1 + Config.COST_PER_SIDE)
     if needed > cash_available:
@@ -67,6 +70,9 @@ def size_position_adaptive(
 
     max_value = capital * Config.MAX_POSITION_SIZE
     shares = min(shares, int(max_value / price))
+    if Config.MAX_LOSS_PER_TRADE > 0:
+        max_loss_shares = int((capital * Config.MAX_LOSS_PER_TRADE) / risk_per_share)
+        shares = min(shares, max_loss_shares)
 
     needed = shares * price * (1 + Config.COST_PER_SIDE)
     if needed > cash_available:

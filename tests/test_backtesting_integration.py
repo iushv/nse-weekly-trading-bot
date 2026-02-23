@@ -6,6 +6,9 @@ import pandas as pd
 
 from trading_bot.backtesting.engine import BacktestEngine
 from trading_bot.backtesting.walk_forward import WalkForwardAnalysis
+from trading_bot.config.settings import Config
+from trading_bot.data.processors.regime import compute_market_regime
+from trading_bot.risk.position_sizer import size_position
 from trading_bot.strategies.base_strategy import BaseStrategy, Signal
 
 
@@ -80,6 +83,72 @@ def _build_market_data(periods: int = 280) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _build_bearish_market_data(periods: int = 140, symbols: int = 25) -> pd.DataFrame:
+    dates = pd.date_range("2024-01-01", periods=periods, freq="B")
+    rows: list[dict] = []
+    tickers = [f"S{i:02d}" for i in range(symbols)]
+
+    for sym_idx, symbol in enumerate(tickers):
+        base = 300.0 + (sym_idx * 8.0)
+        for i, dt in enumerate(dates):
+            close = base - (i * (0.35 + (sym_idx * 0.002)))
+            close = max(close, 5.0)
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "date": dt,
+                    "open": close * 1.001,
+                    "high": close * 1.01,
+                    "low": close * 0.99,
+                    "close": close,
+                    "volume": 900_000 + (sym_idx * 1_000),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+class RegimeSensitiveStrategy(BaseStrategy):
+    def __init__(self) -> None:
+        super().__init__("Regime Sensitive")
+
+    def generate_signals(
+        self,
+        market_data: pd.DataFrame,
+        alternative_data: pd.DataFrame | None = None,
+        market_regime: dict | None = None,
+    ) -> list[Signal]:
+        if market_data.empty:
+            return []
+        if market_regime is not None and not bool(market_regime.get("is_favorable", True)):
+            return []
+
+        symbols = sorted(str(x) for x in market_data["symbol"].dropna().unique())
+        if not symbols:
+            return []
+        df = market_data[market_data["symbol"] == symbols[0]].sort_values("date")
+        if len(df) < 2:
+            return []
+        price = float(df.iloc[-1]["close"])
+        return [
+            Signal(
+                symbol=symbols[0],
+                action="BUY",
+                price=price,
+                quantity=0,
+                stop_loss=price * 0.99,
+                target=price * 1.01,
+                strategy=self.name,
+                confidence=0.8,
+                timestamp=datetime.now(),
+            )
+        ]
+
+    def check_exit_conditions(self, position: dict, current_data: pd.Series) -> tuple[bool, str | None]:
+        if int(position.get("days_held", 0)) >= 1:
+            return True, "TIME_STOP"
+        return False, None
+
+
 def test_backtest_engine_returns_contract_fields():
     market_data = _build_market_data(periods=140)
     strategy = DeterministicTrendStrategy()
@@ -110,6 +179,7 @@ def test_backtest_engine_returns_contract_fields():
     assert isinstance(results["portfolio_history"], list)
     assert len(results["portfolio_history"]) > 0
     assert results["total_trades"] > 0
+    assert "regime_summary" in results
 
 
 def test_walk_forward_analysis_returns_windows_and_summary_contract():
@@ -227,3 +297,103 @@ def test_backtest_marks_open_positions_when_symbol_missing_for_day():
     )
     assert day_with_missing_aaa["num_positions"] >= 1
     assert day_with_missing_aaa["positions_value"] > 0
+
+
+def test_compute_market_regime_returns_expected_keys():
+    market_data = _build_market_data(periods=80)
+    regime = compute_market_regime(market_data)
+
+    assert "is_favorable" in regime
+    assert "breadth_ratio" in regime
+    assert "confidence" in regime
+    assert "regime_label" in regime
+    assert 0.0 <= float(regime["confidence"]) <= 1.0
+
+
+def test_backtest_with_regime_differs_from_without(monkeypatch):
+    monkeypatch.setattr(Config, "ADAPTIVE_DEFENSIVE_BREADTH_SMA_PERIOD", 5)
+    monkeypatch.setattr(Config, "MOMENTUM_REGIME_SMA_PERIOD", 5)
+    monkeypatch.setattr(Config, "MOMENTUM_REGIME_VOL_WINDOW", 5)
+    monkeypatch.setattr(Config, "ADAPTIVE_DEFENSIVE_MIN_BREADTH", 0.50)
+    monkeypatch.setattr(Config, "ADAPTIVE_DEFENSIVE_MIN_ELIGIBLE_SYMBOLS", 1)
+
+    market_data = _build_bearish_market_data()
+    strategy = RegimeSensitiveStrategy()
+
+    with_regime_engine = BacktestEngine(initial_capital=100000)
+    with_regime = with_regime_engine.run_backtest(
+        strategy=strategy,
+        market_data=market_data,
+        start_date="2024-02-01",
+        end_date="2024-07-31",
+        include_regime=True,
+    )
+
+    without_regime_engine = BacktestEngine(initial_capital=100000)
+    without_regime = without_regime_engine.run_backtest(
+        strategy=strategy,
+        market_data=market_data,
+        start_date="2024-02-01",
+        end_date="2024-07-31",
+        include_regime=False,
+    )
+
+    assert with_regime["total_trades"] != without_regime["total_trades"]
+    assert with_regime["total_trades"] < without_regime["total_trades"]
+    assert with_regime["regime_summary"]["total_days"] > 0
+    assert without_regime["regime_summary"]["total_days"] == 0
+
+
+def test_max_loss_per_trade_caps_position_size(monkeypatch):
+    """MAX_LOSS_PER_TRADE limits position size so worst-case loss is bounded."""
+    monkeypatch.setattr(Config, "RISK_PER_TRADE", 0.02)
+    monkeypatch.setattr(Config, "MAX_POSITION_SIZE", 0.15)
+    monkeypatch.setattr(Config, "MAX_LOSS_PER_TRADE", 0.01)
+
+    engine = BacktestEngine(initial_capital=100000)
+    signal = Signal(
+        symbol="TEST",
+        action="BUY",
+        price=100.0,
+        quantity=0,
+        stop_loss=90.0,  # risk_per_share = 10
+        target=120.0,
+        strategy="test",
+        confidence=0.8,
+        timestamp=datetime.now(),
+    )
+
+    # Without cap: risk_amount = 0.02 * 100000 = 2000, shares = 2000/10 = 200
+    # With cap:    max_loss   = 0.01 * 100000 = 1000, shares = 1000/10 = 100
+    size = engine._calculate_position_size(signal)
+    assert size <= 100
+    assert size > 0
+
+
+def test_runtime_sizer_matches_backtest_with_max_loss_cap(monkeypatch):
+    monkeypatch.setattr(Config, "RISK_PER_TRADE", 0.02)
+    monkeypatch.setattr(Config, "MAX_POSITION_SIZE", 1.0)
+    monkeypatch.setattr(Config, "MAX_LOSS_PER_TRADE", 0.01)
+    monkeypatch.setattr(Config, "COST_PER_SIDE", 0.0)
+
+    signal = Signal(
+        symbol="TEST",
+        action="BUY",
+        price=100.0,
+        quantity=0,
+        stop_loss=90.0,
+        target=120.0,
+        strategy="test",
+        confidence=0.8,
+        timestamp=datetime.now(),
+    )
+    backtest_engine = BacktestEngine(initial_capital=100000)
+    backtest_size = backtest_engine._calculate_position_size(signal)
+    runtime_size = size_position(
+        price=signal.price,
+        stop_loss=signal.stop_loss,
+        capital=100000.0,
+        cash_available=100000.0,
+    )
+
+    assert backtest_size == runtime_size

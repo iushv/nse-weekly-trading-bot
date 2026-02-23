@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from trading_bot.risk.position_sizer import size_position_adaptive
+from trading_bot.config.settings import Config
+from trading_bot.risk.position_sizer import size_position, size_position_adaptive
 from trading_bot.risk.risk_manager import RiskManager
 from trading_bot.strategies.base_strategy import Signal
 
@@ -103,3 +104,38 @@ def test_size_position_adaptive_throttles_on_drawdown_and_sector_exposure():
     assert normal > 0
     assert throttled > 0
     assert throttled < normal
+
+
+def test_size_position_respects_max_loss_per_trade(monkeypatch):
+    monkeypatch.setattr(Config, "RISK_PER_TRADE", 0.02)
+    monkeypatch.setattr(Config, "MAX_POSITION_SIZE", 1.0)
+    monkeypatch.setattr(Config, "MAX_LOSS_PER_TRADE", 0.01)
+    monkeypatch.setattr(Config, "COST_PER_SIDE", 0.0)
+
+    shares = size_position(
+        price=100.0,
+        stop_loss=90.0,
+        capital=100000.0,
+        cash_available=100000.0,
+    )
+    assert shares == 100
+
+
+def test_size_position_adaptive_respects_max_loss_per_trade(monkeypatch):
+    monkeypatch.setattr(Config, "RISK_PER_TRADE", 0.02)
+    monkeypatch.setattr(Config, "MAX_POSITION_SIZE", 1.0)
+    monkeypatch.setattr(Config, "MAX_LOSS_PER_TRADE", 0.01)
+    monkeypatch.setattr(Config, "COST_PER_SIDE", 0.0)
+
+    shares = size_position_adaptive(
+        price=100.0,
+        stop_loss=90.0,
+        capital=100000.0,
+        cash_available=100000.0,
+        confidence=1.0,
+        win_rate=0.65,
+        avg_win_loss_ratio=1.5,
+        current_drawdown=0.0,
+        sector_exposure=0.0,
+    )
+    assert shares == 100
