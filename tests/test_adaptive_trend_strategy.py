@@ -28,19 +28,24 @@ def _build_market_data(symbols: list[str], periods: int = 180) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def test_regime_gate_blocks_unfavorable_market():
-    strategy = AdaptiveTrendFollowingStrategy()
+def test_unfavorable_regime_does_not_hard_block_entries(monkeypatch):
+    strategy = AdaptiveTrendFollowingStrategy(max_new_per_week=1)
     market_data = _build_market_data(["AAA"])
+    monkeypatch.setattr(strategy, "_entry_conditions", lambda _daily, _weekly, **_kwargs: True)
+    monkeypatch.setattr(strategy, "_estimate_expected_r_multiple", lambda _price, _weekly: 1.5)
 
     signals = strategy.generate_signals(
         market_data=market_data,
         market_regime={
+            "is_favorable": False,
             "breadth_ratio": 0.25,
             "annualized_volatility": 0.35,
             "trend_up": False,
         },
     )
-    assert signals == []
+    assert len(signals) == 1
+    assert strategy.last_scan_stats["reason"] == "scan_complete"
+    assert strategy.last_scan_stats["blocked_by_regime"] is False
 
 
 def test_generate_signals_respects_weekly_cap(monkeypatch):
@@ -113,7 +118,7 @@ def test_trend_consistency_floor_tightens_in_weak_regime(monkeypatch):
     market_data = _build_market_data(["AAA", "BBB", "CCC"])
     monkeypatch.setattr(strategy, "_entry_conditions", lambda _daily, _weekly, **_kwargs: True)
     monkeypatch.setattr(strategy, "_estimate_expected_r_multiple", lambda _price, _weekly: 1.5)
-    monkeypatch.setattr(strategy, "_trend_consistency_ratio", lambda _weekly: 0.55)
+    monkeypatch.setattr(strategy, "_trend_consistency_ratio", lambda _weekly: 0.54)
 
     favorable = strategy.generate_signals(
         market_data=market_data,
@@ -141,7 +146,7 @@ def test_expected_r_floor_tightens_with_regime_steps(monkeypatch):
     )
     weak = strategy.generate_signals(
         market_data=market_data,
-        market_regime={"is_favorable": True, "confidence": 0.5, "breadth_ratio": 0.5, "annualized_volatility": 0.45},
+        market_regime={"is_favorable": True, "confidence": 0.4, "breadth_ratio": 0.45, "annualized_volatility": 0.65},
     )
     assert len(favorable) == 3
     assert weak == []
@@ -192,7 +197,7 @@ def test_entry_conditions_can_fail_with_regime_tightened_thresholds():
     assert strategy._entry_conditions(daily, weekly) is True
 
     min_roc, min_spread, min_vol = strategy._entry_thresholds_for_regime(
-        {"confidence": 0.54, "breadth_ratio": 0.50, "annualized_volatility": 0.51}
+        {"confidence": 0.45, "breadth_ratio": 0.50, "annualized_volatility": 0.51}
     )
     assert strategy._entry_conditions(
         daily,
@@ -201,6 +206,53 @@ def test_entry_conditions_can_fail_with_regime_tightened_thresholds():
         min_ema_spread_pct=min_spread,
         min_volume_ratio=min_vol,
     ) is False
+
+
+def test_entry_conditions_use_configurable_daily_rsi_band():
+    strategy = AdaptiveTrendFollowingStrategy(daily_rsi_min=40.0, daily_rsi_max=72.0)
+    daily = pd.Series({"close": 101.0, "SMA_20": 100.0, "RSI_14": 42.0})
+    weekly = pd.Series(
+        {
+            "close": 101.0,
+            "EMA_S": 100.6,
+            "EMA_L": 100.0,
+            "ROC_4": 0.04,
+            "RSI": 55.0,
+            "ATR": 2.0,
+            "VOL_RATIO": 1.0,
+        }
+    )
+    assert strategy._entry_conditions(daily, weekly) is True
+
+    stricter = AdaptiveTrendFollowingStrategy(daily_rsi_min=45.0, daily_rsi_max=70.0)
+    assert stricter._entry_conditions(daily, weekly) is False
+
+
+def test_scan_stats_capture_entry_reasons(monkeypatch):
+    strategy = AdaptiveTrendFollowingStrategy(max_new_per_week=3)
+    market_data = _build_market_data(["AAA"])
+
+    monkeypatch.setattr(strategy, "_trend_consistency_ratio", lambda _weekly: 1.0)
+    monkeypatch.setattr(strategy, "_estimate_expected_r_multiple", lambda _price, _weekly: 1.5)
+
+    def _fail_entry(_daily, _weekly, **kwargs):
+        failure_reasons = kwargs.get("failure_reasons")
+        if isinstance(failure_reasons, list):
+            failure_reasons.clear()
+            failure_reasons.extend(["volume_ratio", "daily_rsi_band"])
+        return False
+
+    monkeypatch.setattr(strategy, "_entry_conditions", _fail_entry)
+
+    signals = strategy.generate_signals(
+        market_data=market_data,
+        market_regime={"is_favorable": True},
+    )
+
+    assert signals == []
+    assert strategy.last_scan_stats["reason"] == "scan_complete"
+    assert strategy.last_scan_stats["entry_reasons"]["volume_ratio"] == 1
+    assert strategy.last_scan_stats["entry_reasons"]["daily_rsi_band"] == 1
 
 
 def test_trailing_stop_exit_when_profit_protected():
@@ -280,6 +332,21 @@ def test_progressive_trail_at_5pct_gain():
     assert reason == "TRAILING_STOP"
 
 
+def test_progressive_trail_uses_configurable_tiers():
+    strategy = AdaptiveTrendFollowingStrategy(
+        profit_trail_atr_mult=0.7,
+        profit_protect_pct=0.04,
+        trail_tier2_gain=0.06,
+        trail_tier2_mult=1.1,
+        trail_tier3_gain=0.10,
+        trail_tier3_mult=1.3,
+    )
+    assert strategy._progressive_trail_mult(0.11) == 0.7
+    assert strategy._progressive_trail_mult(0.07) == 1.1
+    assert strategy._progressive_trail_mult(0.05) == 1.3
+    assert strategy._progressive_trail_mult(0.02) == strategy.stop_atr_mult
+
+
 def test_trend_break_exit():
     strategy = AdaptiveTrendFollowingStrategy()
     should_exit, reason = strategy.check_exit_conditions(
@@ -334,6 +401,7 @@ def test_stop_loss_exit_takes_priority():
     assert reason == "STOP_LOSS"
 
 
+
 def test_signal_timestamp_is_recent(monkeypatch):
     strategy = AdaptiveTrendFollowingStrategy(max_new_per_week=1)
     market_data = _build_market_data(["AAA"])
@@ -344,3 +412,69 @@ def test_signal_timestamp_is_recent(monkeypatch):
         market_regime={"breadth_ratio": 0.8, "annualized_volatility": 0.15, "trend_up": True},
     )[0]
     assert abs((datetime.now() - signal.timestamp).total_seconds()) < 5
+
+
+def test_high_atr_pct_entry_rejected(monkeypatch):
+    """ATR-cap filter rejects entries where weekly_atr / price > max_weekly_atr_pct."""
+    strategy = AdaptiveTrendFollowingStrategy(max_new_per_week=3, max_weekly_atr_pct=0.05)
+    market_data = _build_market_data(["AAA"])
+    monkeypatch.setattr(strategy, "_entry_conditions", lambda _daily, _weekly, **_kwargs: True)
+    monkeypatch.setattr(strategy, "_estimate_expected_r_multiple", lambda _price, _weekly: 1.5)
+
+    # Patch _build_weekly_indicators to return data with ATR/close > 0.05
+    original_build_weekly = strategy._build_weekly_indicators
+
+    def _high_atr_weekly(frame):
+        weekly = original_build_weekly(frame)
+        if not weekly.empty:
+            weekly["ATR"] = weekly["close"] * 0.08  # 8% ATR — above the 5% cap
+        return weekly
+
+    monkeypatch.setattr(strategy, "_build_weekly_indicators", _high_atr_weekly)
+
+    signals = strategy.generate_signals(
+        market_data=market_data,
+        market_regime={"is_favorable": True},
+    )
+    assert signals == []
+    assert strategy.last_scan_stats["high_atr_pct"] == 1
+
+
+def test_breakeven_floor_includes_transaction_cost():
+    """Breakeven floor includes transaction cost so near-breakeven trades aren't net-negative."""
+    strategy = AdaptiveTrendFollowingStrategy(
+        breakeven_gain_pct=0.03,
+        breakeven_buffer_pct=0.005,
+        transaction_cost_pct=0.004,
+    )
+    position = {
+        "entry_price": 100.0,
+        "stop_loss": 92.0,
+        "target": 130.0,
+        "days_held": 7,
+        "highest_close": 104.0,  # gain_pct = 4% > 3% breakeven_gain_pct
+        "weekly_atr": 0.5,
+        "metadata": {"weekly_ema_short": 105.0, "weekly_ema_long": 100.0},
+        "current_weekly_ema_short": 106.0,
+        "current_weekly_ema_long": 101.0,
+    }
+
+    # close=100.85 is above old floor (100.50) but below new floor (100.90)
+    # Should trigger breakeven because 100.85 <= 100 * (1 + 0.005 + 0.004) = 100.90
+    should_exit, reason = strategy.check_exit_conditions(position, pd.Series({"close": 100.85}))
+    assert should_exit is True
+    assert reason == "BREAKEVEN_STOP"
+
+    # With weekly_atr=0.5:
+    # gain_pct = 0.04 >= profit_protect_pct (0.03) -> trail_mult = 1.2
+    # trailing_stop = 104 - (1.2 * 0.5) = 104 - 0.6 = 103.4
+    # Wait, 103.4 is still > 100.95. I need a much smaller ATR or different trail config.
+    # If trail_mult = 1.5 (gain < 3%): TS = 104 - 1.5*0.5 = 103.25.
+    # Let's set weekly_atr to 10.0 so trailing_stop is 104 - 1.2*10 = 92.0.
+    # Then 100.95 > 92.0 - no trailing stop.
+    position["weekly_atr"] = 10.0
+
+    # close=100.95 is above the new breakeven floor (100.90) — should NOT trigger
+    should_exit2, reason2 = strategy.check_exit_conditions(position, pd.Series({"close": 100.95}))
+    assert should_exit2 is False
+    assert reason2 is None

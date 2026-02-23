@@ -14,6 +14,8 @@ from trading_bot.data.storage.database import db
 class AlternativeDataScraper:
     def __init__(self, headless: bool = True) -> None:
         self.session = requests.Session()
+        # Avoid inheriting broken env proxy values during scraping.
+        self.session.trust_env = False
         # Chrome Desktop headers (tested and working with NSE)
         self.session.headers.update(
             {

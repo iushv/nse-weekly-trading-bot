@@ -37,6 +37,9 @@ class MarketDataCollector:
         self.groww_chunk_days = max(1, int(Config.GROWW_HISTORICAL_CHUNK_DAYS))
         self.groww_client: GrowwHttpClient | None = None
         self.session = requests.Session()
+        # Some environments export dead system proxies (e.g., 127.0.0.1:9).
+        # Disable implicit env-proxy usage for market-data fetches.
+        self.session.trust_env = False
         # Chrome Desktop headers (tested and working with NSE)
         self.session.headers.update(
             {
@@ -346,7 +349,7 @@ class MarketDataCollector:
             "Referer": "https://www.nseindia.com/",
         }
         try:
-            r = requests.get(url, headers=headers, timeout=15)
+            r = self.session.get(url, headers=headers, timeout=15)
             if r.status_code == 404:
                 return None  # holiday / weekend
             r.raise_for_status()
@@ -615,10 +618,22 @@ class MarketDataCollector:
 
         return out
 
-    def update_daily_data(self, symbols: list[str]) -> None:
+    @staticmethod
+    def _latest_trading_day(anchor: date) -> date:
+        current = anchor
+        while current.weekday() >= 5:
+            current = current - timedelta(days=1)
+        return current
+
+    def update_daily_data(
+        self,
+        symbols: list[str],
+        *,
+        required_latest_date: date | None = None,
+    ) -> dict[str, Any]:
         today = datetime.now().date()
         fetch_start = today - timedelta(days=3)
-        freshness_threshold = today - timedelta(days=1)
+        freshness_threshold = required_latest_date or self._latest_trading_day(today)
 
         stale_symbols: list[str] = []
         skipped_fresh = 0
@@ -641,7 +656,14 @@ class MarketDataCollector:
                 skipped_fresh,
                 0,
             )
-            return
+            return {
+                "symbols": len(symbols),
+                "required_latest_date": str(freshness_threshold),
+                "updated_symbols": 0,
+                "skipped_fresh": skipped_fresh,
+                "failed_symbols": 0,
+                "unresolved_symbols": [],
+            }
 
         updated_symbols = 0
         failed_symbols = 0
@@ -657,9 +679,11 @@ class MarketDataCollector:
                 try:
                     if df is not None and not df.empty:
                         db.insert_price_data(df, sym)
-                        updated_symbols += 1
-                        if sym in remaining:
-                            remaining.remove(sym)
+                        latest_after = self._get_latest_price_date(sym)
+                        if latest_after is not None and latest_after >= freshness_threshold:
+                            updated_symbols += 1
+                            if sym in remaining:
+                                remaining.remove(sym)
                 except Exception as exc:
                     logger.warning(f"Batch insert failed for {sym}: {exc}")
 
@@ -669,12 +693,26 @@ class MarketDataCollector:
                 df = self.fetch_historical_data(symbol, start_date=fetch_start)
                 if df is not None and not df.empty:
                     db.insert_price_data(df, symbol)
-                    updated_symbols += 1
+                    latest_after = self._get_latest_price_date(symbol)
+                    if latest_after is not None and latest_after >= freshness_threshold:
+                        updated_symbols += 1
+                    else:
+                        failed_symbols += 1
                 else:
                     failed_symbols += 1
             except Exception as exc:
                 logger.error(f"Failed to update {symbol}: {exc}")
                 failed_symbols += 1
+
+        unresolved_symbols: list[str] = []
+        for symbol in symbols:
+            latest_date = None
+            try:
+                latest_date = self._get_latest_price_date(symbol)
+            except Exception:
+                latest_date = None
+            if latest_date is None or latest_date < freshness_threshold:
+                unresolved_symbols.append(symbol)
 
         logger.info(
             "Daily data update summary: symbols={} updated={} skipped_fresh={} failed={}",
@@ -683,6 +721,14 @@ class MarketDataCollector:
             skipped_fresh,
             failed_symbols,
         )
+        return {
+            "symbols": len(symbols),
+            "required_latest_date": str(freshness_threshold),
+            "updated_symbols": updated_symbols,
+            "skipped_fresh": skipped_fresh,
+            "failed_symbols": failed_symbols,
+            "unresolved_symbols": unresolved_symbols,
+        }
 
     def backfill_historical_data(self, symbols: list[str], start_date: str = "2020-01-01") -> None:
         logger.info(f"Starting backfill from {start_date}")

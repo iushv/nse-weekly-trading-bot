@@ -41,7 +41,18 @@ def bot_with_test_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setattr(main_module.TelegramReporter, "send_morning_report", lambda *args, **kwargs: None)
 
     bot = main_module.TradingBot(paper_mode=True)
-    monkeypatch.setattr(bot.data_collector, "update_daily_data", lambda symbols: None)
+    monkeypatch.setattr(
+        bot.data_collector,
+        "update_daily_data",
+        lambda symbols, **kwargs: {
+            "symbols": len(symbols),
+            "required_latest_date": str(kwargs.get("required_latest_date", "")),
+            "updated_symbols": 0,
+            "skipped_fresh": len(symbols),
+            "failed_symbols": 0,
+            "unresolved_symbols": [],
+        },
+    )
     return bot, test_db
 
 

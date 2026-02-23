@@ -8,6 +8,7 @@ import pandas as pd
 from loguru import logger
 
 from trading_bot.config.settings import Config
+from trading_bot.data.processors.regime import compute_market_regime
 from trading_bot.strategies.base_strategy import BaseStrategy, Signal
 
 
@@ -50,6 +51,7 @@ class BacktestEngine:
         end_date: str,
         alternative_data: pd.DataFrame | None = None,
         warmup_days: int = 260,
+        include_regime: bool = True,
     ) -> dict:
         data = market_data.copy()
         data["date"] = pd.to_datetime(data["date"])
@@ -67,6 +69,7 @@ class BacktestEngine:
         if not test_dates:
             return {"error": "No market data for selected period"}
 
+        regime_snapshots: list[dict[str, Any]] = []
         for current_date in sorted(data["date"].dt.date.unique()):
             if current_date < start_ts.date():
                 continue
@@ -74,7 +77,10 @@ class BacktestEngine:
             history = data[data["date"].dt.date <= current_date]
             self._process_exits(strategy, str(current_date), daily, history)
 
-            signals = strategy.generate_signals(history, alternative_data)
+            regime = compute_market_regime(history) if include_regime else None
+            if regime is not None:
+                regime_snapshots.append(regime)
+            signals = strategy.generate_signals(history, alternative_data, market_regime=regime)
             for signal in signals:
                 self._execute_signal(signal, str(current_date), daily)
 
@@ -82,7 +88,13 @@ class BacktestEngine:
 
         final_date = str(max(test_dates))
         self._close_all_positions(final_date, data[data["date"].dt.date == pd.to_datetime(final_date).date()])
-        return self._calculate_results(strategy.name, start_date, end_date)
+        return self._calculate_results(
+            strategy.name,
+            start_date,
+            end_date,
+            regime_snapshots=regime_snapshots,
+            include_regime=include_regime,
+        )
 
     def _execute_signal(self, signal: Signal, current_date: str, daily_data: pd.DataFrame) -> None:
         if signal.symbol in self.state.positions:
@@ -236,6 +248,10 @@ class BacktestEngine:
         max_shares = int(max_value / signal.price)
         shares = min(shares, max_shares)
 
+        if Config.MAX_LOSS_PER_TRADE > 0:
+            max_loss_shares = int(Config.MAX_LOSS_PER_TRADE * self.initial_capital / risk_per_share)
+            shares = min(shares, max_loss_shares)
+
         required = shares * signal.price * (1 + self.transaction_costs)
         if required > self.state.cash:
             shares = int(self.state.cash / (signal.price * (1 + self.transaction_costs)))
@@ -278,7 +294,35 @@ class BacktestEngine:
                 cache[symbol] = (float(ema_s), float(ema_l))
         return cache
 
-    def _calculate_results(self, strategy_name: str, start_date: str, end_date: str) -> dict:
+    @staticmethod
+    def _summarize_regimes(regime_snapshots: list[dict[str, Any]], include_regime: bool) -> dict[str, Any]:
+        total_days = len(regime_snapshots)
+        favorable_days = sum(1 for item in regime_snapshots if bool(item.get("is_favorable", False)))
+        defensive_days = sum(1 for item in regime_snapshots if str(item.get("regime_label", "")) == "defensive")
+        label_counts: dict[str, int] = {}
+        for item in regime_snapshots:
+            label = str(item.get("regime_label", "unknown"))
+            label_counts[label] = label_counts.get(label, 0) + 1
+
+        return {
+            "include_regime": bool(include_regime),
+            "favorable_days": favorable_days,
+            "defensive_days": defensive_days,
+            "total_days": total_days,
+            "favorable_pct": (favorable_days / max(total_days, 1)),
+            "label_counts": label_counts,
+        }
+
+    def _calculate_results(
+        self,
+        strategy_name: str,
+        start_date: str,
+        end_date: str,
+        *,
+        regime_snapshots: list[dict[str, Any]] | None = None,
+        include_regime: bool = True,
+    ) -> dict:
+        regime_summary = self._summarize_regimes(regime_snapshots or [], include_regime)
         if not self.state.closed_trades:
             return {
                 "strategy": strategy_name,
@@ -290,6 +334,7 @@ class BacktestEngine:
                 "sharpe_ratio": 0.0,
                 "trades": [],
                 "portfolio_history": self.state.portfolio_history,
+                "regime_summary": regime_summary,
             }
 
         trades_df = pd.DataFrame(self.state.closed_trades)
@@ -322,6 +367,7 @@ class BacktestEngine:
             "sharpe_ratio": sharpe,
             "trades": self.state.closed_trades,
             "portfolio_history": self.state.portfolio_history,
+            "regime_summary": regime_summary,
         }
 
 

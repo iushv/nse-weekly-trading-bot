@@ -11,7 +11,7 @@ This runbook defines how to move from paper mode to live mode with staged capita
 ## Entry Criteria (Before Stage 1)
 - `python scripts/preflight_check.py --include-broker --fail-on-broker --pretty` passes.
 - `python scripts/promotion_checklist.py --include-broker --fail-on-broker --pretty` passes.
-- `python scripts/paper_run_tracker.py --required-weeks 4 --require-promotion-bundle --pretty` reports ready.
+- `python scripts/paper_run_tracker.py --require-promotion-bundle --pretty` reports ready for the active profile.
 - Kill switch and rollback commands verified in dry run.
 
 ## Capital Stages

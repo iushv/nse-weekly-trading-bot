@@ -1,11 +1,17 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import date, timedelta
 
 import pandas as pd
 
+from trading_bot.data.collectors.alternative_data import AlternativeDataScraper
 from trading_bot.data.collectors.market_data import MarketDataCollector
 from trading_bot.data.collectors import market_data as market_data_module
+
+
+def test_collectors_disable_env_proxy_usage():
+    assert MarketDataCollector().session.trust_env is False
+    assert AlternativeDataScraper().session.trust_env is False
 
 
 def test_update_daily_data_skips_fresh_symbols(monkeypatch):
@@ -79,6 +85,47 @@ def test_update_daily_data_fetches_stale_symbols(monkeypatch):
 
     assert fetch_calls["count"] == 1
     assert inserted == ["RELIANCE.NS"]
+
+
+def test_update_daily_data_honors_required_latest_date(monkeypatch):
+    collector = MarketDataCollector()
+    required_date = date(2026, 2, 17)
+    previous_day = date(2026, 2, 16)
+    latest_map = {"RELIANCE.NS": previous_day}
+
+    monkeypatch.setattr(collector, "_get_latest_price_date", lambda symbol: latest_map.get(symbol, previous_day))
+
+    sample = pd.DataFrame(
+        {
+            "Date": pd.date_range("2026-02-17", periods=1, freq="D"),
+            "Open": [100.0],
+            "High": [101.0],
+            "Low": [99.0],
+            "Close": [100.5],
+            "Volume": [1000],
+            "Adj Close": [100.5],
+        }
+    )
+
+    def fake_fetch(symbol, start_date, end_date=None):
+        _ = start_date
+        _ = end_date
+        latest_map[symbol] = required_date
+        return sample
+
+    monkeypatch.setattr(collector, "fetch_historical_data", fake_fetch)
+    monkeypatch.setattr(market_data_module.db, "insert_price_data", lambda df, symbol: len(df))
+
+    summary = collector.update_daily_data(["RELIANCE.NS"], required_latest_date=required_date)
+
+    assert int(summary["updated_symbols"]) == 1
+    assert int(summary["failed_symbols"]) == 0
+    assert summary["unresolved_symbols"] == []
+
+
+def test_latest_trading_day_rolls_back_weekend():
+    collector = MarketDataCollector()
+    assert collector._latest_trading_day(date(2026, 2, 15)) == date(2026, 2, 13)
 
 
 def test_get_nifty_midcap_150_list_parses_symbols(monkeypatch, tmp_path):

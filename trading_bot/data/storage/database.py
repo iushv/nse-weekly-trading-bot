@@ -33,9 +33,24 @@ class Database:
             for statement in schema.split(";"):
                 if statement.strip():
                     conn.execute(text(statement))
+            self._ensure_trades_columns(conn)
             conn.commit()
 
         logger.info("Database initialized successfully")
+
+    @staticmethod
+    def _ensure_trades_columns(conn) -> None:
+        required_columns = {
+            "highest_close": "REAL",
+            "lowest_close": "REAL",
+            "weekly_atr": "REAL",
+        }
+        existing_rows = conn.execute(text("PRAGMA table_info(trades)")).fetchall()
+        existing = {str(row[1]).lower() for row in existing_rows}
+        for column, sql_type in required_columns.items():
+            if column.lower() in existing:
+                continue
+            conn.execute(text(f"ALTER TABLE trades ADD COLUMN {column} {sql_type}"))
 
     @contextmanager
     def get_session(self):

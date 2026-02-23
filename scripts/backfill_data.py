@@ -18,7 +18,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--provider",
-        choices=["auto", "yfinance", "groww"],
+        choices=["auto", "yfinance", "groww", "bhavcopy"],
         default=None,
         help="Historical data provider override.",
     )

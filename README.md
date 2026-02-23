@@ -2,6 +2,17 @@
 
 Automated swing-trading framework for Indian equities with modular strategies, risk controls, paper trading, backtesting, and Telegram reporting.
 
+## Current Status And Roadmap
+
+Use `IMPLEMENTATION_PLAN.md` as the single source of truth for:
+- current runtime status,
+- timeline/history,
+- next steps,
+- roadblocks,
+- promotion readiness.
+
+This README is intentionally setup-and-usage focused.
+
 ## Quick Start
 
 ```bash
@@ -19,7 +30,7 @@ Key `.env` options:
 - `BROKER_PROVIDER=mock|groww|http`
 - `GROWW_TOKEN_MODE=approval|totp|access_token`
 - `BROKER_BASE_URL=https://api.groww.in` (default for `groww`; required for `http`)
-- `MARKET_DATA_PROVIDER=auto|yfinance|groww` (historical OHLCV source selection)
+- `MARKET_DATA_PROVIDER=auto|bhavcopy|yfinance|groww` (historical OHLCV source selection)
 - `GROWW_HISTORICAL_EXCHANGE`, `GROWW_HISTORICAL_SEGMENT`, `GROWW_HISTORICAL_INTERVAL`, `GROWW_HISTORICAL_CHUNK_DAYS`
 - `RECONCILIATION_ENFORCE_CLOSE=0|1` (auto-close local OPEN trades missing at broker)
 - `RECONCILIATION_LOOKBACK_DAYS=30` (lookback for open-trade reconciliation)
@@ -27,14 +38,16 @@ Key `.env` options:
 - `RETENTION_DAYS=30` and `RETENTION_SOURCES=...` (scheduled artifact rotation scope)
 - `PAPER_RUN_REQUIRED_WEEKS=4` and `PAPER_RUN_REQUIRE_PROMOTION_BUNDLE=1` (paper-run gate behavior)
 - `AUTO_RESUME_ENABLED=1` and `AUTO_RESUME_*` windows (restart recovery for missed routines)
-- `STRATEGY_PROFILE=baseline|tuned_momentum_v2|tuned_momentum_v3|tuned_momentum_v4|tuned_momentum_v5|tuned_momentum_v6` (runtime strategy/risk preset)
-- `ENABLE_MOMENTUM_BREAKOUT`, `ENABLE_MEAN_REVERSION`, `ENABLE_SECTOR_ROTATION` (toggle strategies)
+- `STRATEGY_PROFILE=adaptive` (active runtime profile for current paper run; legacy tuned momentum profiles are retained for historical replay/analysis only)
+- `ENABLE_ADAPTIVE_TREND=1` (active strategy)
+- `ENABLE_MOMENTUM_BREAKOUT`, `ENABLE_MEAN_REVERSION`, `ENABLE_SECTOR_ROTATION` (legacy strategy toggles, currently disabled in active paper run)
 - `RISK_PER_TRADE`, `MAX_POSITION_SIZE`, `TOTAL_COST_PER_TRADE`, `COST_PER_SIDE`, `MAX_SIGNALS_PER_DAY`, `MIN_EXPECTED_EDGE_PCT` and `MOMENTUM_*`, `MEAN_REV_*` (parameter overrides without code edits)
 - `MOMENTUM_ENABLE_REGIME_FILTER`, `MOMENTUM_REGIME_SMA_PERIOD`, `MOMENTUM_REGIME_VOL_WINDOW`, `MOMENTUM_REGIME_MAX_ANNUAL_VOL` (market-regime gate for momentum entries)
 
 ## Core Features
 
-- Momentum breakout, mean reversion, and sector rotation strategies
+- Adaptive trend-following strategy for the active paper run
+- Legacy momentum breakout, mean reversion, and sector rotation strategies for historical replay/comparison
 - Historical backtesting and walk-forward evaluation
 - Risk controls: position sizing, heat limits, daily/weekly loss caps
 - Paper mode by default, with pluggable broker interface for live mode
@@ -63,11 +76,8 @@ scripts/backfill_data.py
 ## Development Commands
 
 - `python main.py --mode paper --test`: run one-cycle dry run
-- `STRATEGY_PROFILE=tuned_momentum_v2 python main.py --mode paper --test`: run paper dry run with tuned momentum profile
-- `STRATEGY_PROFILE=tuned_momentum_v3 python main.py --mode paper --test`: run paper dry run with higher-turnover tuned profile
-- `STRATEGY_PROFILE=tuned_momentum_v4 python main.py --mode paper --test`: run paper dry run with quality-focused momentum profile
-- `STRATEGY_PROFILE=tuned_momentum_v5 python main.py --mode paper --test`: run paper dry run with gate-focused momentum profile (improved win-rate / reduced drawdown in latest sweep)
-- `STRATEGY_PROFILE=tuned_momentum_v6 python main.py --mode paper --test`: run paper dry run with lower-risk, higher-expectancy momentum profile
+- `STRATEGY_PROFILE=adaptive ENABLE_ADAPTIVE_TREND=1 ENABLE_MOMENTUM_BREAKOUT=0 ENABLE_MEAN_REVERSION=0 ENABLE_SECTOR_ROTATION=0 python main.py --mode paper --test`: run one adaptive-only paper cycle
+- `STRATEGY_PROFILE=adaptive ENABLE_ADAPTIVE_TREND=1 ENABLE_MOMENTUM_BREAKOUT=0 ENABLE_MEAN_REVERSION=0 ENABLE_SECTOR_ROTATION=0 python main.py --mode paper`: run continuous adaptive-only scheduler
 - `python main.py --mode live --dry-run-live --test`: exercise live dependencies without placing broker orders
 - `python scripts/backfill_data.py --start-date 2022-01-01 --limit 30`: load historical data
 - `python scripts/backfill_data.py --provider groww --use-fallback-universe --start-date 2025-01-01 --limit 60`: backfill using Groww historical API
@@ -75,7 +85,7 @@ scripts/backfill_data.py
 - `python scripts/preflight_check.py --include-broker --fail-on-broker --pretty`: include broker read-only check
 - `python scripts/weekly_performance_audit.py --pretty --export-json`: run go-live audit and export JSON artifact
 - `python scripts/promotion_checklist.py --include-broker --fail-on-broker --pretty --allow-not-ready`: run full promotion gate and bundle reports
-- `python scripts/paper_run_tracker.py --required-weeks 4 --require-promotion-bundle --pretty`: verify continuous paper-run readiness
+- `python scripts/paper_run_tracker.py --require-promotion-bundle --pretty --allow-not-ready`: verify profile-aware continuous paper-run readiness
 - `python scripts/weekly_audit_trend.py --lookback 8 --pretty --export-json`: summarize multi-week audit drift and export trend artifact
 - `python scripts/retention_rotate.py --retention-days 30 --pretty --export-json`: archive old logs/report artifacts
 - `python scripts/storage_profile.py --pretty --export-json`: profile artifact growth and suggest retention tuning
@@ -113,8 +123,10 @@ Windows long-running PC:
 
 ## Operations Docs
 
+- `IMPLEMENTATION_PLAN.md`: canonical status, timeline, blockers, and roadmap.
+- `docs/README.md`: documentation map.
 - `docs/LIVE_ROLLOUT_RUNBOOK.md`: staged go-live, rollback, and incident workflow.
-- `docs/PAPER_RUN_ACCEPTANCE.md`: 4-week paper-run acceptance criteria and sign-off checklist.
+- `docs/PAPER_RUN_ACCEPTANCE.md`: profile-aware paper-run acceptance criteria and sign-off checklist.
 - `docs/WINDOWS_AUTORUN.md`: Windows Task Scheduler setup for long-running paper mode.
 - `docs/WINDOWS_MIGRATION_SETUP.md`: move project to Windows PC (Git/zip), preserve paper-run state, and bring up safe paper autorun.
 

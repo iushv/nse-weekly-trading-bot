@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
-from typing import Callable
+from datetime import date, datetime, timedelta
+from typing import Any, Callable
 
 from loguru import logger
 
@@ -114,6 +114,30 @@ class RiskManager:
     def update_pnl(self, pnl: float) -> None:
         self.daily_pnl += pnl
         self.weekly_pnl += pnl
+
+    def reconstruct_realized_pnl(self, engine: Any, today: date) -> None:
+        """Restore daily/weekly realized PnL after process restart."""
+        week_start = today - timedelta(days=today.weekday())
+        query = """
+            SELECT
+                COALESCE(SUM(CASE WHEN date(exit_date) = :today THEN COALESCE(pnl, 0) ELSE 0 END), 0) AS daily_total,
+                COALESCE(SUM(CASE WHEN date(exit_date) >= :week_start AND date(exit_date) <= :today THEN COALESCE(pnl, 0) ELSE 0 END), 0) AS weekly_total
+            FROM trades
+            WHERE status = 'CLOSED'
+        """
+        try:
+            import pandas as pd
+
+            df = pd.read_sql(
+                query,
+                engine,
+                params={"today": today.isoformat(), "week_start": week_start.isoformat()},
+            )
+            if not df.empty:
+                self.daily_pnl = float(df.iloc[0].get("daily_total", 0.0) or 0.0)
+                self.weekly_pnl = float(df.iloc[0].get("weekly_total", 0.0) or 0.0)
+        except Exception as exc:
+            logger.warning(f"RiskManager PnL reconstruction skipped: {exc}")
 
     def check_emergency_stop(self, portfolio_value: float) -> bool:
         drawdown = (portfolio_value - self.capital) / self.capital
