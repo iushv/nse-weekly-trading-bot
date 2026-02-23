@@ -39,19 +39,12 @@ def test_trading_bot_passes_adaptive_runtime_knobs(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(main_module.TelegramReporter, "send_trade_notification", lambda *args, **kwargs: None)
     monkeypatch.setattr(main_module.TelegramReporter, "send_morning_report", lambda *args, **kwargs: None)
 
-    captured: dict[str, float] = {}
-
-    class DummyAdaptiveTrend:
-        def __init__(self, **kwargs):
-            captured.update(kwargs)
-
-    monkeypatch.setattr(main_module, "AdaptiveTrendFollowingStrategy", DummyAdaptiveTrend)
-
     bot = main_module.TradingBot(paper_mode=True)
     assert "adaptive_trend" in bot.strategies
-    assert captured["trail_tier2_gain"] == 0.061
-    assert captured["trail_tier2_mult"] == 1.07
-    assert captured["trail_tier3_gain"] == 0.111
-    assert captured["trail_tier3_mult"] == 1.23
-    assert captured["max_weekly_atr_pct"] == 0.072
-    assert captured["transaction_cost_pct"] == 0.0042
+    strategy = bot.strategies["adaptive_trend"]
+    assert float(getattr(strategy, "trail_tier2_gain", 0.0)) == 0.061
+    assert float(getattr(strategy, "trail_tier2_mult", 0.0)) == 1.07
+    assert float(getattr(strategy, "trail_tier3_gain", 0.0)) == 0.111
+    assert float(getattr(strategy, "trail_tier3_mult", 0.0)) == 1.23
+    assert float(getattr(strategy, "max_weekly_atr_pct", 0.0)) == 0.072
+    assert float(getattr(strategy, "transaction_cost_pct", 0.0)) == 0.0042
