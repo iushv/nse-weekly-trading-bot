@@ -1967,10 +1967,10 @@ class TradingBot:
 
         if not self.paper_mode:
             for t in ["10:05", "12:05", "14:05", "16:05"]:
-                hour, minute = t.split(":")
+                hour_str, minute_str = t.split(":")
                 scheduler.add_job(
                     self.reconciliation_routine,
-                    CronTrigger(day_of_week=weekdays, hour=int(hour), minute=int(minute)),
+                    CronTrigger(day_of_week=weekdays, hour=int(hour_str), minute=int(minute_str)),
                     id=f"reconcile_{t}",
                 )
 
