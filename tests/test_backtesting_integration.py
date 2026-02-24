@@ -397,3 +397,47 @@ def test_runtime_sizer_matches_backtest_with_max_loss_cap(monkeypatch):
     )
 
     assert backtest_size == runtime_size
+
+
+def test_backtest_adaptive_regime_size_multiplier_scales_position(monkeypatch):
+    monkeypatch.setattr(Config, "RISK_PER_TRADE", 0.02)
+    monkeypatch.setattr(Config, "MAX_POSITION_SIZE", 1.0)
+    monkeypatch.setattr(Config, "MAX_LOSS_PER_TRADE", 0.0)
+    monkeypatch.setattr(Config, "ADAPTIVE_REGIME_SIZE_SCALING_ENABLED", True)
+    monkeypatch.setattr(Config, "ADAPTIVE_REGIME_SIZE_MULT_FAVORABLE", 1.0)
+    monkeypatch.setattr(Config, "ADAPTIVE_REGIME_SIZE_MULT_CHOPPY", 0.5)
+    monkeypatch.setattr(Config, "ADAPTIVE_REGIME_SIZE_MULT_BEARISH", 0.25)
+    monkeypatch.setattr(Config, "ADAPTIVE_REGIME_SIZE_MULT_DEFENSIVE", 0.25)
+
+    engine = BacktestEngine(initial_capital=100000)
+    favorable_signal = Signal(
+        symbol="TEST",
+        action="BUY",
+        price=100.0,
+        quantity=0,
+        stop_loss=90.0,
+        target=120.0,
+        strategy="Adaptive Trend",
+        confidence=0.8,
+        timestamp=datetime.now(),
+        metadata={"market_regime_label": "favorable"},
+    )
+    choppy_signal = Signal(
+        symbol="TEST",
+        action="BUY",
+        price=100.0,
+        quantity=0,
+        stop_loss=90.0,
+        target=120.0,
+        strategy="Adaptive Trend",
+        confidence=0.8,
+        timestamp=datetime.now(),
+        metadata={"market_regime_label": "choppy"},
+    )
+
+    favorable_size = engine._calculate_position_size(favorable_signal)
+    choppy_size = engine._calculate_position_size(choppy_signal)
+
+    assert favorable_size > 0
+    assert choppy_size > 0
+    assert choppy_size < favorable_size

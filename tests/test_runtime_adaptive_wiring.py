@@ -28,6 +28,13 @@ def test_trading_bot_passes_adaptive_runtime_knobs(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(Config, "ADAPTIVE_TREND_TRAIL_TIER3_GAIN", 0.111, raising=False)
     monkeypatch.setattr(Config, "ADAPTIVE_TREND_TRAIL_TIER3_MULT", 1.23, raising=False)
     monkeypatch.setattr(Config, "ADAPTIVE_TREND_MAX_WEEKLY_ATR_PCT", 0.072, raising=False)
+    monkeypatch.setattr(Config, "ADAPTIVE_TREND_DYNAMIC_STOP_ENABLED", True, raising=False)
+    monkeypatch.setattr(Config, "ADAPTIVE_TREND_DYNAMIC_STOP_HIGH_ATR_PCT", 0.081, raising=False)
+    monkeypatch.setattr(Config, "ADAPTIVE_TREND_DYNAMIC_STOP_LOW_ATR_PCT", 0.039, raising=False)
+    monkeypatch.setattr(Config, "ADAPTIVE_TREND_DYNAMIC_STOP_HIGH_VOL_SCALE", 0.83, raising=False)
+    monkeypatch.setattr(Config, "ADAPTIVE_TREND_DYNAMIC_STOP_LOW_VOL_SCALE", 1.14, raising=False)
+    monkeypatch.setattr(Config, "ADAPTIVE_TREND_DYNAMIC_STOP_MIN_MULT", 1.05, raising=False)
+    monkeypatch.setattr(Config, "ADAPTIVE_TREND_DYNAMIC_STOP_MAX_MULT", 1.95, raising=False)
     monkeypatch.setattr(Config, "TOTAL_COST_PER_TRADE", 0.0042, raising=False)
 
     monkeypatch.setattr(main_module.MarketDataCollector, "get_nifty_500_list", lambda self: ["TEST.NS"])
@@ -47,4 +54,11 @@ def test_trading_bot_passes_adaptive_runtime_knobs(monkeypatch, tmp_path: Path):
     assert float(getattr(strategy, "trail_tier3_gain", 0.0)) == 0.111
     assert float(getattr(strategy, "trail_tier3_mult", 0.0)) == 1.23
     assert float(getattr(strategy, "max_weekly_atr_pct", 0.0)) == 0.072
+    assert bool(getattr(strategy, "dynamic_stop_enabled", False)) is True
+    assert float(getattr(strategy, "dynamic_stop_high_atr_pct", 0.0)) == 0.081
+    assert float(getattr(strategy, "dynamic_stop_low_atr_pct", 0.0)) == 0.039
+    assert float(getattr(strategy, "dynamic_stop_high_vol_scale", 0.0)) == 0.83
+    assert float(getattr(strategy, "dynamic_stop_low_vol_scale", 0.0)) == 1.14
+    assert float(getattr(strategy, "dynamic_stop_min_mult", 0.0)) == 1.05
+    assert float(getattr(strategy, "dynamic_stop_max_mult", 0.0)) == 1.95
     assert float(getattr(strategy, "transaction_cost_pct", 0.0)) == 0.0042

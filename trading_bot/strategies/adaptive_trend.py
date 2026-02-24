@@ -40,6 +40,13 @@ class AdaptiveTrendFollowingStrategy(BaseStrategy):
         breakeven_gain_pct: float = 0.03,
         breakeven_buffer_pct: float = 0.005,
         max_weekly_atr_pct: float = 0.08,
+        dynamic_stop_enabled: bool = False,
+        dynamic_stop_high_atr_pct: float = 0.08,
+        dynamic_stop_low_atr_pct: float = 0.04,
+        dynamic_stop_high_vol_scale: float = 0.85,
+        dynamic_stop_low_vol_scale: float = 1.10,
+        dynamic_stop_min_mult: float = 1.0,
+        dynamic_stop_max_mult: float = 2.0,
         transaction_cost_pct: float = 0.00355,
         max_positions: int = 5,
         max_new_per_week: int = 3,
@@ -72,6 +79,13 @@ class AdaptiveTrendFollowingStrategy(BaseStrategy):
         self.breakeven_gain_pct = float(breakeven_gain_pct)
         self.breakeven_buffer_pct = float(breakeven_buffer_pct)
         self.max_weekly_atr_pct = float(max_weekly_atr_pct)
+        self.dynamic_stop_enabled = bool(dynamic_stop_enabled)
+        self.dynamic_stop_high_atr_pct = float(dynamic_stop_high_atr_pct)
+        self.dynamic_stop_low_atr_pct = float(dynamic_stop_low_atr_pct)
+        self.dynamic_stop_high_vol_scale = float(dynamic_stop_high_vol_scale)
+        self.dynamic_stop_low_vol_scale = float(dynamic_stop_low_vol_scale)
+        self.dynamic_stop_min_mult = float(dynamic_stop_min_mult)
+        self.dynamic_stop_max_mult = float(dynamic_stop_max_mult)
         self.transaction_cost_pct = float(transaction_cost_pct)
         self.max_positions = int(max_positions)
         self.max_new_per_week = int(max_new_per_week)
@@ -202,15 +216,19 @@ class AdaptiveTrendFollowingStrategy(BaseStrategy):
                 scan_stats["high_atr_pct"] += 1
                 continue
 
-            expected_r = self._estimate_expected_r_multiple(price, w)
+            stop_atr_mult_used = self._entry_stop_atr_mult(price, weekly_atr)
+            if self.dynamic_stop_enabled:
+                expected_r = self._estimate_expected_r_multiple(price, w, stop_atr_mult=stop_atr_mult_used)
+            else:
+                expected_r = self._estimate_expected_r_multiple(price, w)
             expected_r_floor = min(self.min_expected_r_mult + (0.08 * tighten_steps), 1.4)
             if expected_r < expected_r_floor:
                 scan_stats["low_expected_r"] += 1
                 continue
 
-            stop_loss = price - (self.stop_atr_mult * weekly_atr)
+            stop_loss = price - (stop_atr_mult_used * weekly_atr)
             # Signal API expects a numeric target; exits are trailing/time based.
-            target = price + (self.stop_atr_mult * weekly_atr * 4.0)
+            target = price + (stop_atr_mult_used * weekly_atr * 4.0)
             confidence = self._confidence(d, w)
             signal = Signal(
                 symbol=str(symbol),
@@ -228,6 +246,8 @@ class AdaptiveTrendFollowingStrategy(BaseStrategy):
                     "weekly_atr": weekly_atr,
                     "weekly_rsi": float(w["RSI"]),
                     "weekly_roc": float(w["ROC_4"]),
+                    "weekly_atr_pct": atr_pct,
+                    "stop_atr_mult_used": stop_atr_mult_used,
                     "daily_sma20": float(d["SMA_20"]),
                     "daily_rsi": float(d["RSI_14"]),
                     "volume_ratio": float(w["VOL_RATIO"]),
@@ -308,7 +328,8 @@ class AdaptiveTrendFollowingStrategy(BaseStrategy):
                 return True, "TREND_BREAK"
 
         if weekly_atr > 0 and days_held >= self.min_hold_days:
-            trail_mult = self._progressive_trail_mult(gain_pct)
+            entry_stop_mult = float(metadata.get("stop_atr_mult_used", self.stop_atr_mult))
+            trail_mult = self._progressive_trail_mult(gain_pct, base_stop_atr_mult=entry_stop_mult)
             trailing_stop = highest_close - (trail_mult * weekly_atr)
             if current_price <= trailing_stop:
                 return True, "TRAILING_STOP"
@@ -319,14 +340,15 @@ class AdaptiveTrendFollowingStrategy(BaseStrategy):
                 return True, "TIME_STOP"
         return False, None
 
-    def _progressive_trail_mult(self, gain_pct: float) -> float:
+    def _progressive_trail_mult(self, gain_pct: float, base_stop_atr_mult: float | None = None) -> float:
+        base_mult = self.stop_atr_mult if base_stop_atr_mult is None else float(base_stop_atr_mult)
         if gain_pct >= self.trail_tier3_gain:
             return self.profit_trail_atr_mult
         if gain_pct >= self.trail_tier2_gain:
             return self.trail_tier2_mult
         if gain_pct >= self.profit_protect_pct:
             return self.trail_tier3_mult
-        return self.stop_atr_mult
+        return base_mult
 
     def _regime_allows_entry(self, market_regime: dict[str, Any] | None) -> bool:
         # Binary regime gating is disabled; regime should influence thresholds, not block all entries.
@@ -405,7 +427,7 @@ class AdaptiveTrendFollowingStrategy(BaseStrategy):
         min_volume_ratio = min(min_volume_ratio, 1.0)
         return min_weekly_roc, min_ema_spread_pct, min_volume_ratio
 
-    def _estimate_expected_r_multiple(self, entry_price: float, weekly: pd.Series) -> float:
+    def _estimate_expected_r_multiple(self, entry_price: float, weekly: pd.Series, *, stop_atr_mult: float | None = None) -> float:
         if entry_price <= 0:
             return 0.0
         weekly_close = float(weekly["close"])
@@ -418,10 +440,40 @@ class AdaptiveTrendFollowingStrategy(BaseStrategy):
 
         ema_spread_pct = (weekly_ema_s - weekly_ema_l) / weekly_close if weekly_close > 0 else 0.0
         trend_proxy_pct = max(weekly_roc, max(ema_spread_pct, 0.0) * 4.0)
-        risk_pct = (self.stop_atr_mult * weekly_atr) / entry_price
+        effective_stop_mult = self.stop_atr_mult if stop_atr_mult is None else float(stop_atr_mult)
+        risk_pct = (effective_stop_mult * weekly_atr) / entry_price
         if risk_pct <= 0:
             return 0.0
         return float(max(trend_proxy_pct / risk_pct, 0.0))
+
+    @staticmethod
+    def _clamp(value: float, lower: float, upper: float) -> float:
+        return float(max(lower, min(upper, value)))
+
+    def _entry_stop_atr_mult(self, entry_price: float, weekly_atr: float) -> float:
+        if not self.dynamic_stop_enabled:
+            return self.stop_atr_mult
+        if entry_price <= 0 or weekly_atr <= 0:
+            return self.stop_atr_mult
+
+        atr_pct = weekly_atr / entry_price
+        low_atr = max(1e-6, self.dynamic_stop_low_atr_pct)
+        high_atr = max(low_atr + 1e-6, self.dynamic_stop_high_atr_pct)
+
+        if atr_pct <= low_atr:
+            scale = self.dynamic_stop_low_vol_scale
+        elif atr_pct >= high_atr:
+            scale = self.dynamic_stop_high_vol_scale
+        else:
+            ratio = (atr_pct - low_atr) / (high_atr - low_atr)
+            scale = self.dynamic_stop_low_vol_scale + (
+                ratio * (self.dynamic_stop_high_vol_scale - self.dynamic_stop_low_vol_scale)
+            )
+
+        stop_mult = self.stop_atr_mult * scale
+        lower = min(self.dynamic_stop_min_mult, self.dynamic_stop_max_mult)
+        upper = max(self.dynamic_stop_min_mult, self.dynamic_stop_max_mult)
+        return self._clamp(stop_mult, lower, upper)
 
     def _entry_conditions(
         self,

@@ -106,6 +106,51 @@ def test_size_position_adaptive_throttles_on_drawdown_and_sector_exposure():
     assert throttled < normal
 
 
+def test_size_position_adaptive_applies_regime_size_multiplier(monkeypatch):
+    monkeypatch.setattr(Config, "MAX_POSITION_SIZE", 1.0)
+    base = size_position_adaptive(
+        price=100.0,
+        stop_loss=95.0,
+        capital=100000.0,
+        cash_available=100000.0,
+        confidence=0.8,
+        win_rate=0.6,
+        avg_win_loss_ratio=1.4,
+        current_drawdown=0.0,
+        sector_exposure=0.0,
+        regime_size_multiplier=1.0,
+    )
+    reduced = size_position_adaptive(
+        price=100.0,
+        stop_loss=95.0,
+        capital=100000.0,
+        cash_available=100000.0,
+        confidence=0.8,
+        win_rate=0.6,
+        avg_win_loss_ratio=1.4,
+        current_drawdown=0.0,
+        sector_exposure=0.0,
+        regime_size_multiplier=0.5,
+    )
+    blocked = size_position_adaptive(
+        price=100.0,
+        stop_loss=95.0,
+        capital=100000.0,
+        cash_available=100000.0,
+        confidence=0.8,
+        win_rate=0.6,
+        avg_win_loss_ratio=1.4,
+        current_drawdown=0.0,
+        sector_exposure=0.0,
+        regime_size_multiplier=0.0,
+    )
+
+    assert base > 0
+    assert reduced > 0
+    assert reduced < base
+    assert blocked == 0
+
+
 def test_size_position_respects_max_loss_per_trade(monkeypatch):
     monkeypatch.setattr(Config, "RISK_PER_TRADE", 0.02)
     monkeypatch.setattr(Config, "MAX_POSITION_SIZE", 1.0)

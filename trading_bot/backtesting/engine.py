@@ -243,6 +243,13 @@ class BacktestEngine:
         if risk_per_share <= 0:
             return 0
 
+        strategy_key = str(signal.strategy).strip().lower().replace(" ", "_")
+        if strategy_key == "adaptive_trend":
+            metadata = signal.metadata if isinstance(signal.metadata, dict) else {}
+            risk_amount *= self._adaptive_regime_size_multiplier(metadata)
+            if risk_amount <= 0:
+                return 0
+
         shares = int(risk_amount / risk_per_share)
         max_value = self.initial_capital * Config.MAX_POSITION_SIZE
         max_shares = int(max_value / signal.price)
@@ -256,6 +263,36 @@ class BacktestEngine:
         if required > self.state.cash:
             shares = int(self.state.cash / (signal.price * (1 + self.transaction_costs)))
         return max(shares, 0)
+
+    @staticmethod
+    def _adaptive_regime_size_multiplier(metadata: dict[str, Any]) -> float:
+        if not Config.ADAPTIVE_REGIME_SIZE_SCALING_ENABLED:
+            return 1.0
+
+        label = str(
+            metadata.get(
+                "market_regime_label",
+                metadata.get("regime_label", "unknown"),
+            )
+        ).strip().lower()
+        if label == "favorable":
+            return max(0.0, float(Config.ADAPTIVE_REGIME_SIZE_MULT_FAVORABLE))
+        if label == "choppy":
+            return max(0.0, float(Config.ADAPTIVE_REGIME_SIZE_MULT_CHOPPY))
+        if label == "bearish":
+            return max(0.0, float(Config.ADAPTIVE_REGIME_SIZE_MULT_BEARISH))
+        if label == "defensive":
+            return max(0.0, float(Config.ADAPTIVE_REGIME_SIZE_MULT_DEFENSIVE))
+
+        favorable = bool(
+            metadata.get(
+                "market_breadth_favorable",
+                metadata.get("regime_favorable", True),
+            )
+        )
+        if favorable:
+            return max(0.0, float(Config.ADAPTIVE_REGIME_SIZE_MULT_FAVORABLE))
+        return max(0.0, float(Config.ADAPTIVE_REGIME_SIZE_MULT_CHOPPY))
 
     def _compute_weekly_ema_cache(
         self,

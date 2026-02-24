@@ -427,7 +427,7 @@ def test_high_atr_pct_entry_rejected(monkeypatch):
     def _high_atr_weekly(frame):
         weekly = original_build_weekly(frame)
         if not weekly.empty:
-            weekly["ATR"] = weekly["close"] * 0.08  # 8% ATR — above the 5% cap
+            weekly["ATR"] = weekly["close"] * 0.08  # 8% ATR - above the 5% cap
         return weekly
 
     monkeypatch.setattr(strategy, "_build_weekly_indicators", _high_atr_weekly)
@@ -474,7 +474,51 @@ def test_breakeven_floor_includes_transaction_cost():
     # Then 100.95 > 92.0 - no trailing stop.
     position["weekly_atr"] = 10.0
 
-    # close=100.95 is above the new breakeven floor (100.90) — should NOT trigger
+    # close=100.95 is above the new breakeven floor (100.90) - should NOT trigger
     should_exit2, reason2 = strategy.check_exit_conditions(position, pd.Series({"close": 100.95}))
     assert should_exit2 is False
     assert reason2 is None
+
+
+def test_dynamic_entry_stop_mult_scales_with_atr_pct():
+    strategy = AdaptiveTrendFollowingStrategy(
+        stop_atr_mult=1.5,
+        dynamic_stop_enabled=True,
+        dynamic_stop_low_atr_pct=0.04,
+        dynamic_stop_high_atr_pct=0.08,
+        dynamic_stop_low_vol_scale=1.10,
+        dynamic_stop_high_vol_scale=0.80,
+        dynamic_stop_min_mult=1.0,
+        dynamic_stop_max_mult=2.0,
+    )
+
+    low_vol_mult = strategy._entry_stop_atr_mult(entry_price=100.0, weekly_atr=3.0)
+    mid_vol_mult = strategy._entry_stop_atr_mult(entry_price=100.0, weekly_atr=6.0)
+    high_vol_mult = strategy._entry_stop_atr_mult(entry_price=100.0, weekly_atr=10.0)
+
+    assert low_vol_mult > mid_vol_mult > high_vol_mult
+    assert high_vol_mult >= 1.0
+    assert low_vol_mult <= 2.0
+
+
+def test_generate_signals_includes_dynamic_stop_metadata(monkeypatch):
+    strategy = AdaptiveTrendFollowingStrategy(
+        max_new_per_week=1,
+        dynamic_stop_enabled=True,
+        stop_atr_mult=1.5,
+    )
+    market_data = _build_market_data(["AAA"])
+    monkeypatch.setattr(strategy, "_entry_conditions", lambda _daily, _weekly, **_kwargs: True)
+    monkeypatch.setattr(strategy, "_estimate_expected_r_multiple", lambda _price, _weekly, **_kwargs: 1.5)
+
+    signals = strategy.generate_signals(
+        market_data=market_data,
+        market_regime={"is_favorable": True},
+    )
+    assert len(signals) == 1
+    metadata = signals[0].metadata
+    assert "stop_atr_mult_used" in metadata
+    assert "weekly_atr_pct" in metadata
+    assert float(metadata["stop_atr_mult_used"]) > 0
+    assert float(metadata["weekly_atr_pct"]) > 0
+

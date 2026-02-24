@@ -1406,6 +1406,36 @@ class TradingBot:
 
         return max(0.0, min(1.0, sector_value / total_value))
 
+    @staticmethod
+    def _adaptive_regime_size_multiplier(metadata: dict[str, Any]) -> float:
+        if not Config.ADAPTIVE_REGIME_SIZE_SCALING_ENABLED:
+            return 1.0
+
+        label = str(
+            metadata.get(
+                "market_regime_label",
+                metadata.get("regime_label", "unknown"),
+            )
+        ).strip().lower()
+        if label == "favorable":
+            return max(0.0, float(Config.ADAPTIVE_REGIME_SIZE_MULT_FAVORABLE))
+        if label == "choppy":
+            return max(0.0, float(Config.ADAPTIVE_REGIME_SIZE_MULT_CHOPPY))
+        if label == "bearish":
+            return max(0.0, float(Config.ADAPTIVE_REGIME_SIZE_MULT_BEARISH))
+        if label == "defensive":
+            return max(0.0, float(Config.ADAPTIVE_REGIME_SIZE_MULT_DEFENSIVE))
+
+        favorable = bool(
+            metadata.get(
+                "market_breadth_favorable",
+                metadata.get("regime_favorable", True),
+            )
+        )
+        if favorable:
+            return max(0.0, float(Config.ADAPTIVE_REGIME_SIZE_MULT_FAVORABLE))
+        return max(0.0, float(Config.ADAPTIVE_REGIME_SIZE_MULT_CHOPPY))
+
     def _size_signal_position(self, signal: Signal, cash_available: float) -> int:
         if not self._is_adaptive_signal(signal):
             return size_position(signal.price, signal.stop_loss, Config.STARTING_CAPITAL, cash_available)
@@ -1414,6 +1444,7 @@ class TradingBot:
         drawdown = max(0.0, (Config.STARTING_CAPITAL - self.portfolio_value) / max(Config.STARTING_CAPITAL, 1.0))
         metadata = signal.metadata or {}
         sector_exposure = self._get_sector_exposure(str(metadata.get("sector")) if metadata.get("sector") else None)
+        regime_size_multiplier = self._adaptive_regime_size_multiplier(metadata)
 
         return size_position_adaptive(
             price=signal.price,
@@ -1425,6 +1456,7 @@ class TradingBot:
             avg_win_loss_ratio=float(stats.get("avg_win_loss_ratio", 1.2)),
             current_drawdown=drawdown,
             sector_exposure=sector_exposure,
+            regime_size_multiplier=regime_size_multiplier,
         )
 
     def _score_signal(self, signal: Signal) -> float:

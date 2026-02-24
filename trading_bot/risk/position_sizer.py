@@ -34,6 +34,7 @@ def size_position_adaptive(
     avg_win_loss_ratio: float,
     current_drawdown: float,
     sector_exposure: float,
+    regime_size_multiplier: float = 1.0,
 ) -> int:
     """
     Adaptive sizing for lower-frequency strategies.
@@ -64,8 +65,9 @@ def size_position_adaptive(
 
     # Reduce new size in concentrated sectors.
     sector_scale = 0.6 if sector_exposure > 0.15 else 1.0
+    regime_scale = max(0.0, float(regime_size_multiplier))
 
-    risk_amount = capital * base_fraction * conf_scale * drawdown_scale * sector_scale
+    risk_amount = capital * base_fraction * conf_scale * drawdown_scale * sector_scale * regime_scale
     shares = int(risk_amount / risk_per_share)
 
     max_value = capital * Config.MAX_POSITION_SIZE
