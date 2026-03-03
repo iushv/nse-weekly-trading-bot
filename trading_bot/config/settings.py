@@ -339,6 +339,7 @@ class Config:
     ENABLE_ADAPTIVE_TREND = _env_bool("ENABLE_ADAPTIVE_TREND", False)
     ENABLE_BEAR_REVERSAL = _env_bool("ENABLE_BEAR_REVERSAL", False)
     ENABLE_VOLATILITY_REVERSAL = _env_bool("ENABLE_VOLATILITY_REVERSAL", False)
+    ENABLE_CROSS_SECTIONAL_MOMENTUM = _env_bool("ENABLE_CROSS_SECTIONAL_MOMENTUM", False)
 
     MOMENTUM_LOOKBACK_PERIOD = _env_int(
         "MOMENTUM_LOOKBACK_PERIOD",
@@ -490,6 +491,11 @@ class Config:
     ADAPTIVE_TREND_REGIME_MIN_BREADTH = _env_float("ADAPTIVE_TREND_REGIME_MIN_BREADTH", 0.50)
     ADAPTIVE_TREND_REGIME_MAX_VOL = _env_float("ADAPTIVE_TREND_REGIME_MAX_VOL", 0.30)
     ADAPTIVE_TREND_ML_ENABLED = _env_bool("ADAPTIVE_TREND_ML_ENABLED", False)
+    CSM_TOP_N = _env_int("CSM_TOP_N", 25)
+    CSM_LOOKBACK_MONTHS = _env_int("CSM_LOOKBACK_MONTHS", 6)
+    CSM_SKIP_RECENT_MONTHS = _env_int("CSM_SKIP_RECENT_MONTHS", 1)
+    CSM_TRAILING_STOP_PCT = _env_float("CSM_TRAILING_STOP_PCT", 0.15)
+    CSM_MIN_HISTORY_DAYS = _env_int("CSM_MIN_HISTORY_DAYS", 140)
 
     # Data Sources
     NIFTY_500_URL = "https://www1.nseindia.com/content/indices/ind_nifty500list.csv"
@@ -500,6 +506,10 @@ class Config:
     GROWW_HISTORICAL_SEGMENT = os.getenv("GROWW_HISTORICAL_SEGMENT", "CASH").strip().upper()
     GROWW_HISTORICAL_INTERVAL = os.getenv("GROWW_HISTORICAL_INTERVAL", "1day").strip().lower()
     GROWW_HISTORICAL_CHUNK_DAYS = _env_int("GROWW_HISTORICAL_CHUNK_DAYS", 170)
+    CORPORATE_ACTION_AUTO_ADJUST_ENABLED = _env_bool("CORPORATE_ACTION_AUTO_ADJUST_ENABLED", False)
+    CORPORATE_ACTION_DETECT_THRESHOLD = _env_float("CORPORATE_ACTION_DETECT_THRESHOLD", 0.005)
+    CORPORATE_ACTION_APPLY_THRESHOLD = _env_float("CORPORATE_ACTION_APPLY_THRESHOLD", 0.10)
+    CORPORATE_ACTION_VERIFY_JUMP_THRESHOLD = _env_float("CORPORATE_ACTION_VERIFY_JUMP_THRESHOLD", 0.10)
 
     @classmethod
     def validate(cls) -> bool:
@@ -537,6 +547,7 @@ class Config:
             or cls.ENABLE_ADAPTIVE_TREND
             or cls.ENABLE_BEAR_REVERSAL
             or cls.ENABLE_VOLATILITY_REVERSAL
+            or cls.ENABLE_CROSS_SECTIONAL_MOMENTUM
         ):
             raise ValueError("At least one strategy must be enabled")
         return True

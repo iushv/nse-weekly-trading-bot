@@ -20,6 +20,8 @@ class WalkForwardAnalysis:
         market_data: pd.DataFrame,
         start_date: str,
         end_date: str,
+        engine_kwargs: dict[str, Any] | None = None,
+        backtest_kwargs: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         start = pd.to_datetime(start_date)
         end = pd.to_datetime(end_date)
@@ -28,12 +30,17 @@ class WalkForwardAnalysis:
 
         for idx, (_, _, test_start, test_end) in enumerate(windows, start=1):
             logger.info(f"Running window {idx}/{len(windows)}: {test_start.date()} to {test_end.date()}")
-            engine = BacktestEngine(initial_capital=100000)
+            if hasattr(strategy, "reset_state"):
+                strategy.reset_state()
+            resolved_engine_kwargs = dict(engine_kwargs or {})
+            engine_capital = float(resolved_engine_kwargs.pop("initial_capital", 100000))
+            engine = BacktestEngine(initial_capital=engine_capital, **resolved_engine_kwargs)
             result = engine.run_backtest(
                 strategy=strategy,
                 market_data=market_data,
                 start_date=str(test_start.date()),
                 end_date=str(test_end.date()),
+                **(backtest_kwargs or {}),
             )
             out.append(
                 {

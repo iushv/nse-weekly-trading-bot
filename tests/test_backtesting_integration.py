@@ -149,6 +149,95 @@ class RegimeSensitiveStrategy(BaseStrategy):
         return False, None
 
 
+class OneShotEntryStopStrategy(BaseStrategy):
+    def __init__(self) -> None:
+        super().__init__("One Shot Entry Stop")
+
+    def generate_signals(
+        self,
+        market_data: pd.DataFrame,
+        alternative_data: pd.DataFrame | None = None,
+        market_regime: dict | None = None,
+    ) -> list[Signal]:
+        if market_data.empty:
+            return []
+        df = market_data[market_data["symbol"] == "AAA"].sort_values("date")
+        if len(df) != 1:
+            return []
+        price = float(df.iloc[-1]["close"])
+        return [
+            Signal(
+                symbol="AAA",
+                action="BUY",
+                price=price,
+                quantity=0,
+                stop_loss=price * 0.90,
+                target=price * 1.05,
+                strategy=self.name,
+                confidence=0.9,
+                timestamp=datetime.now(),
+            )
+        ]
+
+    def check_exit_conditions(self, position: dict, current_data: pd.Series) -> tuple[bool, str | None]:
+        if float(current_data["close"]) <= float(position["stop_loss"]):
+            return True, "STOP_LOSS"
+        return False, None
+
+
+class JumpDayEntryStrategy(BaseStrategy):
+    def __init__(self) -> None:
+        super().__init__("Jump Day Entry")
+
+    def generate_signals(
+        self,
+        market_data: pd.DataFrame,
+        alternative_data: pd.DataFrame | None = None,
+        market_regime: dict | None = None,
+    ) -> list[Signal]:
+        if market_data.empty:
+            return []
+        df = market_data[market_data["symbol"] == "AAA"].sort_values("date")
+        if len(df) != 2:
+            return []
+        price = float(df.iloc[-1]["close"])
+        return [
+            Signal(
+                symbol="AAA",
+                action="BUY",
+                price=price,
+                quantity=0,
+                stop_loss=price * 0.95,
+                target=price * 1.05,
+                strategy=self.name,
+                confidence=0.8,
+                timestamp=datetime.now(),
+            )
+        ]
+
+    def check_exit_conditions(self, position: dict, current_data: pd.Series) -> tuple[bool, str | None]:
+        return False, None
+
+
+def _build_jump_market_data() -> pd.DataFrame:
+    dates = pd.date_range("2024-01-01", periods=3, freq="B")
+    closes = [100.0, 55.0, 100.0]  # -45% overnight jump on day 2
+    rows: list[dict] = []
+    for dt, close in zip(dates, closes):
+        rows.append(
+            {
+                "symbol": "AAA",
+                "date": dt,
+                "open": close,
+                "high": close * 1.01,
+                "low": close * 0.99,
+                "close": close,
+                "volume": 1_000_000,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def test_backtest_engine_returns_contract_fields():
     market_data = _build_market_data(periods=140)
     strategy = DeterministicTrendStrategy()
@@ -344,6 +433,93 @@ def test_backtest_with_regime_differs_from_without(monkeypatch):
     assert without_regime["regime_summary"]["total_days"] == 0
 
 
+def test_backtest_exposes_regime_metrics_and_entry_labels():
+    market_data = _build_market_data(periods=140)
+    strategy = DeterministicTrendStrategy()
+    engine = BacktestEngine(initial_capital=100000)
+
+    results = engine.run_backtest(
+        strategy=strategy,
+        market_data=market_data,
+        start_date="2024-02-01",
+        end_date="2024-06-30",
+        include_regime=True,
+    )
+
+    assert "regime_metrics" in results
+    regime_metrics = results["regime_metrics"]
+    assert "daily_returns_by_regime" in regime_metrics
+    assert "entry_regime_trade_metrics" in regime_metrics
+    assert isinstance(regime_metrics["daily_returns_by_regime"], dict)
+    assert isinstance(regime_metrics["entry_regime_trade_metrics"], dict)
+
+    trades = results["trades"]
+    assert trades
+    assert all("entry_regime_label" in trade for trade in trades)
+
+
+def test_backtest_without_regime_labels_all_days_unknown():
+    market_data = _build_market_data(periods=140)
+    strategy = DeterministicTrendStrategy()
+    engine = BacktestEngine(initial_capital=100000)
+
+    results = engine.run_backtest(
+        strategy=strategy,
+        market_data=market_data,
+        start_date="2024-02-01",
+        end_date="2024-06-30",
+        include_regime=False,
+    )
+
+    regime_metrics = results["regime_metrics"]
+    unknown_days = int(regime_metrics.get("unknown_days", 0))
+    assert unknown_days == len(results["portfolio_history"])
+    assert "unknown" in regime_metrics.get("daily_returns_by_regime", {})
+
+
+def test_overnight_jump_guardrail_flags_and_skips_false_stop_loss():
+    market_data = _build_jump_market_data()
+    strategy = OneShotEntryStopStrategy()
+    engine = BacktestEngine(initial_capital=100000)
+
+    results = engine.run_backtest(
+        strategy=strategy,
+        market_data=market_data,
+        start_date="2024-01-01",
+        end_date="2024-01-03",
+        include_regime=False,
+        warmup_days=0,
+    )
+
+    assert results["data_quality_clean"] is False
+    warnings = results.get("data_quality_warnings", [])
+    assert len(warnings) >= 1
+    assert any(item["symbol"] == "AAA" and abs(float(item["pct_change"])) > 0.35 for item in warnings)
+    assert any(item["date"] == "2024-01-02" for item in warnings)
+
+    exit_reasons = {trade["exit_reason"] for trade in results["trades"]}
+    assert "STOP_LOSS" not in exit_reasons
+
+
+def test_overnight_jump_guardrail_blocks_entries_on_flagged_day():
+    market_data = _build_jump_market_data()
+    strategy = JumpDayEntryStrategy()
+    engine = BacktestEngine(initial_capital=100000)
+
+    results = engine.run_backtest(
+        strategy=strategy,
+        market_data=market_data,
+        start_date="2024-01-01",
+        end_date="2024-01-03",
+        include_regime=False,
+        warmup_days=0,
+    )
+
+    assert results["data_quality_clean"] is False
+    assert len(results.get("data_quality_warnings", [])) >= 1
+    assert int(results["total_trades"]) == 0
+
+
 def test_max_loss_per_trade_caps_position_size(monkeypatch):
     """MAX_LOSS_PER_TRADE limits position size so worst-case loss is bounded."""
     monkeypatch.setattr(Config, "RISK_PER_TRADE", 0.02)
@@ -441,3 +617,55 @@ def test_backtest_adaptive_regime_size_multiplier_scales_position(monkeypatch):
     assert favorable_size > 0
     assert choppy_size > 0
     assert choppy_size < favorable_size
+
+
+def test_closed_trade_contains_enriched_fields_for_ml() -> None:
+    market_data = _build_market_data(periods=140)
+    strategy = DeterministicTrendStrategy()
+    engine = BacktestEngine(initial_capital=100000)
+
+    results = engine.run_backtest(
+        strategy=strategy,
+        market_data=market_data,
+        start_date="2024-02-01",
+        end_date="2024-06-30",
+        include_regime=True,
+    )
+
+    trades = results["trades"]
+    assert trades
+    trade = trades[0]
+    assert "metadata" in trade and isinstance(trade["metadata"], dict)
+    assert "confidence" in trade
+    assert "stop_loss" in trade
+    assert "target" in trade
+    assert "mfe" in trade
+    assert "mae" in trade
+    assert float(trade["mfe"]) >= 0.0
+    assert float(trade["mae"]) >= 0.0
+
+
+def test_existing_strategy_unaffected_with_default_engine_mode() -> None:
+    market_data = _build_market_data(periods=140)
+    strategy = DeterministicTrendStrategy()
+
+    default_engine = BacktestEngine(initial_capital=100000)
+    explicit_engine = BacktestEngine(initial_capital=100000, sizing_mode="atr")
+
+    default_result = default_engine.run_backtest(
+        strategy=strategy,
+        market_data=market_data,
+        start_date="2024-02-01",
+        end_date="2024-06-30",
+        include_regime=False,
+    )
+    explicit_result = explicit_engine.run_backtest(
+        strategy=strategy,
+        market_data=market_data,
+        start_date="2024-02-01",
+        end_date="2024-06-30",
+        include_regime=False,
+    )
+
+    assert int(default_result.get("total_trades", 0)) == int(explicit_result.get("total_trades", 0))
+    assert float(default_result.get("total_pnl", 0.0)) == float(explicit_result.get("total_pnl", 0.0))

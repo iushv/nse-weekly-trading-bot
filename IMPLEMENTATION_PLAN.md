@@ -474,3 +474,216 @@ Updated files:
 - Decision: treat Midcap 150 as the active paper-run universe candidate.
   - Switch via `UNIVERSE_FILE=data/universe/nifty_midcap150.txt` (or regenerate file with `scripts/update_universe_midcap150.py`).
   - Paper-run streak must be tracked per-universe (implemented via `run_context.universe_tag`).
+
+## 2026-02-23 Learnings-Driven Guardrails (Do-Not-Repeat Rules)
+Source references: `docs/EXPERIMENT_HISTORY.md`, Step 7/8/9 artifacts in this plan.
+
+1. Keep experiment budget fixed per cycle.
+   - Hard cap: `<=12` backtest runs per tuning cycle (baseline + bounded candidates + retest + holdout + walk-forward).
+   - Use `scripts/run_step9_factorial.py` as the default cycle runner; do not return to ad-hoc 100+ sweep patterns.
+2. Require runtime parity in all validation.
+   - Backtest must run with regime plumbing enabled (`include_regime=true`) for primary decisions.
+   - Regime-off runs are diagnostic only; they cannot be used alone for promotion decisions.
+3. Enforce one-hypothesis-at-a-time changes unless the runner defines a fixed factorial set.
+   - No multi-parameter "combo fishing" outside the constrained factorial script.
+4. Keep known harmful settings locked out unless new evidence clears them.
+   - `ADAPTIVE_MIN_VOLUME_RATIO=0.65` is disallowed for default tuning (degraded PF/Sharpe in regime-aware tests).
+   - Re-enabling binary regime entry gate is disallowed without a dedicated A/B run proving uplift on both baseline and holdout windows.
+5. Avoid exit-only tuning loops when loss concentration is entry-driven.
+   - Step 8 showed exit retuning alone did not cross break-even; prioritize entry-risk and position-risk controls first.
+6. Always preserve trade diagnostics in artifacts.
+   - Backtests used for decisions must include `--include-trades` so `exit_breakdown`, stop-loss concentration, and hold-time shifts are visible.
+7. Promotion evidence must be multi-window, not single-window.
+   - Candidate acceptance requires non-negative holdout behavior and no collapse in walk-forward consistency.
+
+## 2026-02-23 Strategy Rethink Trigger + Path
+Rethink is not default. It is activated only if the current constrained framework fails objective checks.
+
+Activation trigger (any one):
+1. Two consecutive Step 9 cycles fail both `PF >= 1.0` and `Sharpe > 0` on the primary window.
+2. Best candidate fails holdout (`PF < 0.95` or return < 0) after retest.
+3. `STOP_LOSS` remains the dominant PnL sink (`STOP_LOSS total_pnl` more negative than total profit from `TRAILING_STOP`) after risk-cap tuning.
+
+If triggered, run a bounded rethink track (max 6 runs, one commit batch):
+1. Disable binary regime gating permanently (already current default); keep regime data only for threshold/sizing modulation.
+2. Move regime response from hard blocking to risk scaling:
+   - unfavorable/choppy regime: reduced position size multiplier instead of zero-entry gate.
+3. Keep liquidity discipline strict:
+   - retain `ADAPTIVE_MIN_VOLUME_RATIO=0.80` unless a dedicated liquidity study proves improvement on PF and drawdown.
+4. Re-center entry quality on left-tail control:
+   - favor stricter ATR/risk caps before adding new entry complexity.
+5. Accept rethink candidate only if:
+   - baseline window: `PF >= 1.0`, `Sharpe > 0`
+   - holdout window: non-negative return, no material stop-loss concentration worsening
+   - walk-forward: no drop in profitable-window ratio vs current baseline.
+
+## 2026-02-23 Execution Roadmap (From Here)
+1. Complete one Step 9 constrained cycle with current defaults and generate ranked candidates.
+2. Promote only the top candidate that passes retest + holdout; reject all others.
+3. Run one walk-forward check for the promoted candidate.
+4. If candidate still fails profitability gates, activate the rethink trigger path above (bounded 6-run rethink cycle, not open-ended sweeps).
+5. Continue paper trading only with fail-closed live controls unchanged.
+
+## 2026-02-24 Step 9 Runner Reliability + Throughput Update
+- Root cause for the "long-running/no visible progress" issue was identified and fixed in `scripts/run_step9_factorial.py`:
+  - child process output was previously piped and only consumed at process end;
+  - verbose adaptive logs could fill pipe buffers and block child processes.
+- Fixes shipped:
+  - child stdout/stderr redirected to per-run log files (`runXX*.log`);
+  - periodic heartbeats retained for progress visibility;
+  - factorial phase (`run02` to `run09`) now supports parallel execution via `--max-workers`;
+  - backward-compatible resume-context handling retained for older run directories.
+- Commit reference: `9cca336` (`Fix Step9 subprocess pipe deadlock and parallelize factorial runs`).
+
+## 2026-02-24 Step 9 Consecutive Cycles (Primary Window: 2025-08-01 to 2026-02-20)
+Cycle 1 (default Step 9 factor grid, regime-aware):
+- Artifact: `reports/backtests/step9_factorial_20260224_071731/summary.json`
+- Result: `accepted=false`
+- Best candidate: `max_atr_pct=0.08`, `max_loss_per_trade=0.0`, `stop_atr_mult=1.5`
+- In-sample: Sharpe `-0.2135`, PF `0.8711`, trades `53`
+- Holdout: Sharpe `2.4944`, PF `2.6401`
+- Walk-forward: avg Sharpe `-0.1829`, consistency `0.4286`
+
+Cycle 2 (dynamic-stop + regime-size scaling enabled via env overrides):
+- Artifact: `reports/backtests/step9_factorial_20260224_213624/summary.json`
+- Result: `accepted=false`
+- Best candidate: `max_atr_pct=0.08`, `max_loss_per_trade=0.008`, `stop_atr_mult=1.5`
+- In-sample: Sharpe `-0.5068`, PF `0.7580`, trades `64`
+- Holdout: Sharpe `3.0575`, PF `3.1994`
+- Walk-forward: avg Sharpe `-0.0183`, consistency `0.4286`
+
+Decision against trigger criteria:
+- Trigger `#1` is now met: two consecutive Step 9 cycles failed both primary-window gates (`PF >= 1.0` and `Sharpe > 0`).
+- Therefore, per the "Strategy Rethink Trigger + Path" section, the next phase is the bounded rethink track (max 6 runs).
+
+## 2026-02-25 Next Action (Activated): Bounded Rethink Track (Max 6 Runs)
+Guardrails:
+1. Keep experiment budget bounded (`<= 6` runs).
+2. Keep binary regime gate disabled.
+3. Keep liquidity floor unchanged (`ADAPTIVE_MIN_VOLUME_RATIO=0.80`).
+4. No broad parameter sweeps; only targeted left-tail control variants.
+
+Planned 6-run sequence:
+1. `rethink01_baseline_current`:
+   - current active branch config (dynamic stop + regime size scaling ON) as control.
+2. `rethink02_atr_cap_strict`:
+   - tighten ATR cap (`ADAPTIVE_TREND_MAX_WEEKLY_ATR_PCT=0.06`).
+3. `rethink03_loss_cap_strict`:
+   - tighten per-trade cap (`MAX_LOSS_PER_TRADE=0.005`).
+4. `rethink04_combo_strict`:
+   - combine strict ATR + strict loss cap + conservative regime multipliers.
+5. `rethink05_holdout_best`:
+   - run holdout on best in-sample rethink candidate.
+6. `rethink06_walk_forward_best`:
+   - run walk-forward on same best candidate.
+
+Acceptance criteria (same as existing rethink path):
+- Baseline window: `PF >= 1.0` and `Sharpe > 0`
+- Holdout: non-negative return and no material STOP_LOSS concentration worsening
+- Walk-forward: no consistency collapse and no negative avg-sharpe drift relative to current baseline.
+
+## 2026-02-27 ML Entry Scoring Quick Experiment Refinements (Small-Sample Safe)
+Scope: keep this as a bounded yes/no utility check, not a promotion path.
+
+1. Feature cap for N~55:
+   - Limit ML features to 10:
+     - `weekly_rsi`, `weekly_roc`, `daily_rsi`, `volume_ratio`
+     - `market_regime_confidence`, `market_breadth_ratio`
+     - `expected_r_multiple`, `confidence`
+     - `atr_pct`, `stop_distance_pct`
+   - Avoid high-collinearity and non-normalized features in this quick pass.
+2. Add simple-rule null model before ML:
+   - Evaluate rule families `reject_if_atr_pct_gt_X` and `reject_if_stop_distance_pct_gt_X`.
+   - Record STOP_LOSS rejection and winner retention tradeoff.
+   - If simple rule matches/beats ML uplift, prefer the simpler rule path.
+3. Use aggressively regularized LightGBM for tiny samples:
+   - `num_leaves=4`, `max_depth=3`, `min_child_samples=10`
+   - `learning_rate=0.05`, `n_estimators=100`
+   - `subsample=0.8`, `feature_fraction=0.8`
+   - `reg_alpha=1.0`, `reg_lambda=1.0`
+4. Report optimistic vs conservative thresholds:
+   - Optimistic: best swept threshold from range scan.
+   - Conservative: fixed threshold `0.5`.
+   - Treat "sweep passes but fixed 0.5 fails" as overfit risk; do not mark final decision as pass.
+
+## 2026-03-03 Cross-Sectional Momentum (CSM) Phase 1 Status + Phase 1B Plan
+
+Decision context:
+- Adaptive Trend remains exhausted on this evaluation period after repeated bounded cycles.
+- Phase 1 pivot implemented as backtest-only CSM (no orchestrator/live path changes).
+
+Phase 1 implementation status:
+- Completed with targeted engine/walk-forward extensions and CSM strategy/files.
+- Validation:
+  - `ruff` clean on changed scope.
+  - `mypy` clean on changed scope.
+  - `pytest tests/test_cross_sectional_momentum.py tests/test_backtesting_integration.py -q` passed.
+
+Phase 1 artifacts and metrics:
+- Backtest artifact:
+  - `reports/backtests/csm_backtest_midcap150_20250801_20260220.json`
+  - Return `+7.96%`, Sharpe `1.35`, PF `2.77`, max DD `-4.08%`, trades `54`.
+  - Note: PnL is concentrated in period-end liquidation closes (`BACKTEST_END`), not "unrealized" PnL.
+- Walk-forward artifact:
+  - `reports/backtests/csm_walk_forward_midcap150_20240601_20260220_3x3.json`
+  - Avg return `-2.96%`, avg Sharpe `-1.07`, profitable windows `2/5`.
+- Verdict:
+  - Not promotable yet under current walk-forward consistency.
+
+Phase 1 correctness notes (locked):
+1. Equal-weight sizing uses `target_weight` in signal metadata.
+   - Engine converts `target_weight` to allocation using current portfolio equity.
+   - `target_allocation` remains fallback-only for compatibility.
+2. CSM walk-forward uses `include_regime=False` via `backtest_kwargs` (not `engine_kwargs`).
+3. CSM strategy state is reset per walk-forward window via `reset_state()` hook.
+4. Rebalance exits are date-gated to rebalance day only.
+5. Ranking safety filters enabled:
+   - overnight jump exclusion
+   - volatility floor
+   - inf/NaN drop
+   - winsorization only when sample size >= 10
+
+Phase 1B objective:
+- Run a bounded sensitivity grid and A/B crash-protection overlay to test whether CSM can reach acceptable OOS behavior.
+
+Track A: bounded sensitivity grid
+- Grid:
+  - `top_n`: `[15, 25, 35]`
+  - `lookback_months`: `[3, 6, 9]`
+  - `trailing_stop_pct`: `[0.12, 0.20]`
+- Fixed:
+  - `skip_recent_months=1`
+  - `min_history_days=140`
+  - `warmup_days=400`
+- Evaluation:
+  - same rolling OOS protocol as Phase 1
+  - rank by avg Sharpe and report full per-window breakdown
+  - include run-level reproducibility metadata (git SHA, DB URL/path, params, timestamp)
+  - include data-quality warning counts in ranking output
+  - support resume/checkpoint for interrupted long grid runs
+
+Track B: crash-protection overlay (A/B for every grid config)
+- Mechanism:
+  - reduce selected count (`adjusted_n`) under elevated trailing portfolio volatility.
+  - keep exposure reduction real by anchoring per-position weight to base `1/base_top_n`.
+- Critical rule:
+  - when `adjusted_n < base_top_n`, do NOT increase per-position weight to `1/adjusted_n`.
+  - keep per-slot `target_weight = 1/base_top_n` and leave remaining cash intentionally unallocated.
+- Constraints:
+  - long-only, no leverage.
+  - min selected names floor for diversification.
+
+Phase 1B success gates (period-independent):
+- Compelling:
+  - avg Sharpe `> 0`
+  - profitable-window ratio `>= 60%`
+- Pass:
+  - avg Sharpe `> -0.3`
+  - profitable-window ratio `>= 40%`
+- Kill:
+  - all tested configs avg Sharpe `< -0.5`
+  - or repeated structural failure despite crash-protection overlay.
+
+Scope guardrails:
+- Keep Phase 1B backtest-only.
+- Do not modify `main.py` / live orchestration path until a config clears walk-forward gates.
