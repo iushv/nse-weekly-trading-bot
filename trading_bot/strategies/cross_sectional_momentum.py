@@ -20,6 +20,11 @@ class CrossSectionalMomentumStrategy(BaseStrategy):
         min_history_days: int = 140,
         initial_capital: float = 100000.0,
         overnight_jump_threshold: float = 0.35,
+        crash_protection: bool = False,
+        target_vol: float = 0.15,
+        min_exposure: float = 0.25,
+        min_positions: int = 5,
+        vol_lookback_days: int = 126,
         log_signals: bool = True,
     ) -> None:
         super().__init__("Cross Sectional Momentum")
@@ -30,6 +35,11 @@ class CrossSectionalMomentumStrategy(BaseStrategy):
         self.min_history_days = max(20, int(min_history_days))
         self.initial_capital = float(initial_capital)
         self.overnight_jump_threshold = max(0.05, float(overnight_jump_threshold))
+        self.crash_protection = bool(crash_protection)
+        self.target_vol = max(0.01, float(target_vol))
+        self.min_exposure = float(np.clip(min_exposure, 0.0, 1.0))
+        self.min_positions = max(1, int(min_positions))
+        self.vol_lookback_days = max(20, int(vol_lookback_days))
         self.log_signals_enabled = bool(log_signals)
 
         self._current_top_n: set[str] = set()
@@ -37,6 +47,9 @@ class CrossSectionalMomentumStrategy(BaseStrategy):
         self._score_lookup: dict[str, dict[str, float]] = {}
         self._rebalance_pending = False
         self._rebalance_active_date: str | None = None
+        self._last_portfolio_vol = 0.0
+        self._last_crash_scale = 1.0
+        self._last_selected_n = self.top_n
 
     def reset_state(self) -> None:
         self._current_top_n = set()
@@ -44,6 +57,9 @@ class CrossSectionalMomentumStrategy(BaseStrategy):
         self._score_lookup = {}
         self._rebalance_pending = False
         self._rebalance_active_date = None
+        self._last_portfolio_vol = 0.0
+        self._last_crash_scale = 1.0
+        self._last_selected_n = self.top_n
 
     def prepare_rebalance(
         self,
@@ -73,13 +89,16 @@ class CrossSectionalMomentumStrategy(BaseStrategy):
             self._current_top_n = set()
             self._ordered_top_n = []
             self._score_lookup = {}
+            self._last_selected_n = 0
             self._rebalance_pending = True
             self._rebalance_active_date = current_date
             return
 
-        top = score_frame.head(self.top_n).copy()
+        adjusted_n = self._resolve_selected_count(score_frame, frame, current_ts)
+        top = score_frame.head(adjusted_n).copy()
         self._ordered_top_n = [str(sym) for sym in top["symbol"].tolist()]
         self._current_top_n = set(self._ordered_top_n)
+        self._last_selected_n = len(self._ordered_top_n)
         self._score_lookup = {
             str(row["symbol"]): {
                 "score": float(row["score"]),
@@ -150,6 +169,11 @@ class CrossSectionalMomentumStrategy(BaseStrategy):
                 metadata={
                     "target_weight": target_weight,
                     "rebalance_date": self._rebalance_active_date,
+                    "rebalance_base_top_n": int(self.top_n),
+                    "rebalance_selected_n": int(self._last_selected_n),
+                    "crash_protection_enabled": bool(self.crash_protection),
+                    "crash_scale": float(self._last_crash_scale),
+                    "portfolio_vol_annualized": float(self._last_portfolio_vol),
                     "momentum_score": float(score_meta.get("score", 0.0)),
                     "raw_return": float(score_meta.get("raw_return", 0.0)),
                     "annualized_volatility": float(score_meta.get("annualized_volatility", 0.0)),
@@ -260,3 +284,66 @@ class CrossSectionalMomentumStrategy(BaseStrategy):
             score_frame["score"] = score_frame["score"].clip(lower=lower, upper=upper)
 
         return score_frame.sort_values("score", ascending=False).reset_index(drop=True)
+
+    def _resolve_selected_count(
+        self,
+        score_frame: pd.DataFrame,
+        market_data: pd.DataFrame,
+        current_ts: pd.Timestamp,
+    ) -> int:
+        base_n = min(self.top_n, len(score_frame))
+        self._last_portfolio_vol = 0.0
+        self._last_crash_scale = 1.0
+        if not self.crash_protection:
+            return max(1, base_n)
+
+        portfolio_vol = self._compute_portfolio_vol(market_data, current_ts)
+        if not np.isfinite(portfolio_vol) or portfolio_vol <= 0:
+            portfolio_vol = self.target_vol
+        self._last_portfolio_vol = float(portfolio_vol)
+
+        scale_raw = self.target_vol / max(portfolio_vol, 1e-6)
+        scale = float(np.clip(scale_raw, self.min_exposure, 1.0))
+        self._last_crash_scale = scale
+
+        adjusted_n = int(round(self.top_n * scale))
+        adjusted_n = max(self.min_positions, adjusted_n)
+        adjusted_n = min(self.top_n, adjusted_n, len(score_frame))
+        return max(1, adjusted_n)
+
+    def _compute_portfolio_vol(self, market_data: pd.DataFrame, current_ts: pd.Timestamp) -> float:
+        if market_data.empty:
+            return self.target_vol
+        if self._current_top_n:
+            symbols = sorted(self._current_top_n)
+        else:
+            symbols = sorted(str(sym) for sym in market_data["symbol"].dropna().unique())
+        if not symbols:
+            return self.target_vol
+
+        frame = market_data[market_data["symbol"].isin(symbols)][["date", "symbol", "close"]].copy()
+        if frame.empty:
+            return self.target_vol
+        frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+        frame = frame.dropna(subset=["date", "symbol", "close"])
+        frame = frame[frame["date"] <= current_ts]
+        if frame.empty:
+            return self.target_vol
+
+        pivot = frame.pivot_table(index="date", columns="symbol", values="close", aggfunc="last").sort_index()
+        if pivot.empty:
+            return self.target_vol
+
+        returns = pivot.pct_change().replace([np.inf, -np.inf], np.nan)
+        ew_returns = returns.mean(axis=1, skipna=True).dropna()
+        if ew_returns.empty:
+            return self.target_vol
+        if len(ew_returns) > self.vol_lookback_days:
+            ew_returns = ew_returns.tail(self.vol_lookback_days)
+        if len(ew_returns) < 20:
+            return self.target_vol
+
+        vol = float(ew_returns.std(ddof=0) * np.sqrt(252))
+        if not np.isfinite(vol):
+            return self.target_vol
+        return max(vol, 1e-6)

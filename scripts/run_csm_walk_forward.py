@@ -36,6 +36,11 @@ def main() -> int:
     parser.add_argument("--lookback-months", type=int, default=6)
     parser.add_argument("--skip-recent-months", type=int, default=1)
     parser.add_argument("--trailing-stop-pct", type=float, default=0.15)
+    parser.add_argument("--crash-protection", action="store_true")
+    parser.add_argument("--target-vol", type=float, default=0.15)
+    parser.add_argument("--min-exposure", type=float, default=0.25)
+    parser.add_argument("--min-positions", type=int, default=5)
+    parser.add_argument("--vol-lookback-days", type=int, default=126)
     parser.add_argument("--min-history-days", type=int, default=140)
     parser.add_argument("--warmup-days", type=int, default=400)
     parser.add_argument("--max-positions", type=int, default=30)
@@ -67,6 +72,11 @@ def main() -> int:
         lookback_months=int(args.lookback_months),
         skip_recent_months=int(args.skip_recent_months),
         trailing_stop_pct=float(args.trailing_stop_pct),
+        crash_protection=bool(args.crash_protection),
+        target_vol=float(args.target_vol),
+        min_exposure=float(args.min_exposure),
+        min_positions=int(args.min_positions),
+        vol_lookback_days=int(args.vol_lookback_days),
         min_history_days=int(args.min_history_days),
         initial_capital=float(args.capital),
         log_signals=False,
@@ -97,7 +107,10 @@ def main() -> int:
             summary[key] = None
 
     windows = []
+    total_data_quality_warnings = 0
     for item in results.get("windows", []):
+        warning_count = int(item.get("data_quality_warning_count", 0))
+        total_data_quality_warnings += warning_count
         windows.append(
             {
                 "window": int(item["window"]),
@@ -108,6 +121,8 @@ def main() -> int:
                 "max_dd": float(item["max_dd"]),
                 "trades": int(item["trades"]),
                 "win_rate": float(item["win_rate"]),
+                "data_quality_clean": bool(item.get("data_quality_clean", True)),
+                "data_quality_warning_count": warning_count,
             }
         )
 
@@ -120,6 +135,11 @@ def main() -> int:
             "lookback_months": int(args.lookback_months),
             "skip_recent_months": int(args.skip_recent_months),
             "trailing_stop_pct": float(args.trailing_stop_pct),
+            "crash_protection": bool(args.crash_protection),
+            "target_vol": float(args.target_vol),
+            "min_exposure": float(args.min_exposure),
+            "min_positions": int(args.min_positions),
+            "vol_lookback_days": int(args.vol_lookback_days),
             "min_history_days": int(args.min_history_days),
         },
         "engine_config": {
@@ -134,6 +154,7 @@ def main() -> int:
             "test_months": int(args.test_months),
         },
         "summary": summary,
+        "data_quality_warning_count_total": int(total_data_quality_warnings),
         "windows": windows,
     }
 

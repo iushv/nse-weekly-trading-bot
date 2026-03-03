@@ -38,6 +38,34 @@ def _build_market_data(
     return pd.DataFrame(rows)
 
 
+def _build_high_vol_market_data(
+    *,
+    start: str = "2024-01-01",
+    end: str = "2025-12-31",
+    symbols: int = 20,
+) -> pd.DataFrame:
+    dates = pd.bdate_range(start=start, end=end)
+    rows: list[dict] = []
+    for s_idx in range(symbols):
+        symbol = f"HV{s_idx:02d}"
+        price = 100.0 + s_idx
+        for i, dt in enumerate(dates):
+            daily_ret = 0.06 if i % 2 == 0 else -0.055
+            price = max(1.0, price * (1.0 + daily_ret))
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "date": dt,
+                    "open": price * 0.995,
+                    "high": price * 1.02,
+                    "low": price * 0.98,
+                    "close": price,
+                    "volume": 400_000 + (s_idx * 5_000),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def test_check_exit_rebalance_on_rebalance_day() -> None:
     strategy = CrossSectionalMomentumStrategy(top_n=2, trailing_stop_pct=0.15, log_signals=False)
     strategy._current_top_n = {"AAA", "BBB"}
@@ -142,6 +170,147 @@ def test_compute_scores_winsorize_skipped_small_sample() -> None:
     assert len(score_frame) <= 6
     # With small sample (<10), no winsorization clipping should alter the top score ordering.
     assert score_frame.iloc[0]["score"] >= score_frame.iloc[-1]["score"]
+
+
+def test_crash_protection_reduces_top_n_in_high_vol() -> None:
+    frame = _build_high_vol_market_data(symbols=20)
+    strategy = CrossSectionalMomentumStrategy(
+        top_n=15,
+        lookback_months=6,
+        skip_recent_months=1,
+        min_history_days=140,
+        crash_protection=True,
+        target_vol=0.15,
+        min_exposure=0.25,
+        min_positions=5,
+        vol_lookback_days=126,
+        log_signals=False,
+    )
+    current_ts = pd.Timestamp(frame["date"].max())
+    score_frame = strategy._compute_scores(frame, current_ts)
+    selected = strategy._resolve_selected_count(score_frame, frame, current_ts)
+    assert selected < strategy.top_n
+    assert selected >= 5
+    assert strategy._last_crash_scale < 1.0
+
+
+def test_crash_protection_maintains_minimum_positions() -> None:
+    frame = _build_high_vol_market_data(symbols=12)
+    strategy = CrossSectionalMomentumStrategy(
+        top_n=12,
+        lookback_months=6,
+        skip_recent_months=1,
+        min_history_days=140,
+        crash_protection=True,
+        target_vol=0.10,
+        min_exposure=0.10,
+        min_positions=6,
+        vol_lookback_days=126,
+        log_signals=False,
+    )
+    current_ts = pd.Timestamp(frame["date"].max())
+    score_frame = strategy._compute_scores(frame, current_ts)
+    selected = strategy._resolve_selected_count(score_frame, frame, current_ts)
+    assert selected >= 6
+    assert selected <= strategy.top_n
+
+
+def test_crash_protection_no_effect_in_low_vol() -> None:
+    frame = _build_market_data(start="2024-01-01", periods=520, symbols=20)
+    strategy = CrossSectionalMomentumStrategy(
+        top_n=10,
+        lookback_months=6,
+        skip_recent_months=1,
+        min_history_days=140,
+        crash_protection=True,
+        target_vol=0.15,
+        min_exposure=0.25,
+        min_positions=5,
+        vol_lookback_days=126,
+        log_signals=False,
+    )
+    current_ts = pd.Timestamp(frame["date"].max())
+    score_frame = strategy._compute_scores(frame, current_ts)
+    selected = strategy._resolve_selected_count(score_frame, frame, current_ts)
+    assert selected == strategy.top_n
+    assert abs(strategy._last_crash_scale - 1.0) < 1e-9
+
+
+def test_crash_protection_off_by_default() -> None:
+    frame = _build_market_data(start="2024-01-01", periods=520, symbols=20)
+    strategy = CrossSectionalMomentumStrategy(
+        top_n=10,
+        lookback_months=6,
+        skip_recent_months=1,
+        min_history_days=140,
+        log_signals=False,
+    )
+    current_ts = pd.Timestamp(frame["date"].max())
+    score_frame = strategy._compute_scores(frame, current_ts)
+    selected = strategy._resolve_selected_count(score_frame, frame, current_ts)
+    assert selected == strategy.top_n
+    assert abs(strategy._last_crash_scale - 1.0) < 1e-9
+
+
+def test_portfolio_vol_computation_matches_expected() -> None:
+    dates = pd.bdate_range("2025-01-01", periods=30)
+    rows: list[dict] = []
+    for symbol in ("AAA", "BBB"):
+        price = 100.0
+        for i, dt in enumerate(dates):
+            daily_ret = 0.01 if i % 2 == 0 else -0.01
+            price *= 1.0 + daily_ret
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "date": dt,
+                    "open": price,
+                    "high": price,
+                    "low": price,
+                    "close": price,
+                    "volume": 100_000,
+                }
+            )
+    frame = pd.DataFrame(rows)
+    strategy = CrossSectionalMomentumStrategy(
+        top_n=2,
+        crash_protection=True,
+        vol_lookback_days=126,
+        log_signals=False,
+    )
+    strategy._current_top_n = {"AAA", "BBB"}
+    current_ts = pd.Timestamp(frame["date"].max())
+    actual = strategy._compute_portfolio_vol(frame, current_ts)
+
+    pivot = frame.pivot_table(index="date", columns="symbol", values="close", aggfunc="last").sort_index()
+    ew_returns = pivot.pct_change().mean(axis=1, skipna=True).dropna()
+    expected = float(ew_returns.std(ddof=0) * (252.0 ** 0.5))
+    assert abs(actual - expected) < 1e-9
+
+
+def test_crash_protection_keeps_base_target_weight() -> None:
+    frame = _build_high_vol_market_data(symbols=20)
+    strategy = CrossSectionalMomentumStrategy(
+        top_n=15,
+        lookback_months=6,
+        skip_recent_months=1,
+        min_history_days=140,
+        crash_protection=True,
+        target_vol=0.10,
+        min_exposure=0.25,
+        min_positions=5,
+        log_signals=False,
+    )
+    strategy.prepare_rebalance(frame, current_positions={})
+    assert strategy._rebalance_active_date is not None
+    assert strategy._last_selected_n < strategy.top_n
+
+    signals = strategy.generate_signals(frame, current_positions={})
+    assert signals
+    assert len(signals) <= strategy._last_selected_n
+    for signal in signals:
+        assert signal.metadata is not None
+        assert abs(float(signal.metadata["target_weight"]) - (1.0 / strategy.top_n)) < 1e-9
 
 
 def test_generate_signals_rebalance_day_new_buys_and_target_weight() -> None:

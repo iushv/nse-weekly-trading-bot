@@ -52,6 +52,8 @@ class WalkForwardAnalysis:
                     "max_dd": result.get("max_drawdown", 0.0),
                     "trades": result.get("total_trades", 0),
                     "win_rate": result.get("win_rate", 0.0),
+                    "data_quality_clean": bool(result.get("data_quality_clean", True)),
+                    "data_quality_warning_count": int(len(result.get("data_quality_warnings", []))),
                 }
             )
 
