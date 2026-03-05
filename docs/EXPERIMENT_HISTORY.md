@@ -446,16 +446,98 @@ This section tracks major implemented experiment rounds that did not improve pro
        - `VOL_REV_MIN_ATR_PCT ∈ {0.02,0.025,0.03}`
        - `VOL_REV_RR_RATIO ∈ {0.8,1.0}`
        - `VOL_REV_MAX_HOLD_DAYS ∈ {2,3,4}`
-     - Best: baseline momentum-only still `1/4` (`reports/backtests/anchor_volatility_strategy_sweep_20260212_090240.json`)
-     - Representative failure metrics:
+   - Best: baseline momentum-only still `1/4` (`reports/backtests/anchor_volatility_strategy_sweep_20260212_090240.json`)
+   - Representative failure metrics:
        - `vol_only_loose`:
          - `2026-01-22`: Sharpe `-0.2303`, WinRate `0.2500`, Trades `4` (failed `closed_trades`)
          - `2026-01-29`: Sharpe `-4.2047`, WinRate `0.1250`, Trades `8` (failed `closed_trades`)
          - `2026-02-05`: pass (`Sharpe 0.8465`, `WinRate 0.5000`, `Trades 14`)
          - `2026-02-12`: failed `sharpe_ratio` (`Sharpe 0.1486`, `WinRate 0.5625`, `Trades 16`)
-       - `momentum_plus_vol_loose`:
-         - `2026-01-22`: Sharpe `-5.4050`, WinRate `0.3333`, Trades `27`
-         - `2026-01-29`: Sharpe `-8.9506`, WinRate `0.2000`, Trades `25`
-         - `2026-02-05`: Sharpe `0.2957`, WinRate `0.4444`, Trades `27`
-         - `2026-02-12`: pass (`Sharpe 1.8078`, `WinRate 0.5357`, `Trades 28`)
+      - `momentum_plus_vol_loose`:
+        - `2026-01-22`: Sharpe `-5.4050`, WinRate `0.3333`, Trades `27`
+        - `2026-01-29`: Sharpe `-8.9506`, WinRate `0.2000`, Trades `25`
+        - `2026-02-05`: Sharpe `0.2957`, WinRate `0.4444`, Trades `27`
+        - `2026-02-12`: pass (`Sharpe 1.8078`, `WinRate 0.5357`, `Trades 28`)
+
+### 2026-02-24 Step 9 Constrained Cycles (Regime-Aware, Midcap150)
+- Objective: PF-first 12-run bounded cycle (baseline + 8 factorial + retest + holdout + walk-forward).
+- Runtime update during this phase:
+  - `scripts/run_step9_factorial.py` fixed subprocess pipe deadlock and added parallel factorial workers (`--max-workers`).
+  - Commit: `9cca336`.
+
+- Cycle 1 (default Step 9 grid):
+  - Artifact: `reports/backtests/step9_factorial_20260224_071731/summary.json`
+  - Best in-sample: Sharpe `-0.2135`, PF `0.8711`, trades `53`
+  - Holdout: PF `2.6401`, Sharpe `2.4944`
+  - Walk-forward: avg Sharpe `-0.1829`
+  - Result: `accepted=false`
+
+- Cycle 2 (dynamic stop + regime-size scaling env overrides enabled):
+  - Artifact: `reports/backtests/step9_factorial_20260224_213624/summary.json`
+  - Best in-sample: Sharpe `-0.5068`, PF `0.7580`, trades `64`
+  - Holdout: PF `3.1994`, Sharpe `3.0575`
+  - Walk-forward: avg Sharpe `-0.0183`
+  - Result: `accepted=false`
+
+- Decision impact:
+  - Two consecutive Step 9 failures on primary-window PF/Sharpe criteria.
+  - Per `IMPLEMENTATION_PLAN.md`, this activates the bounded rethink track (max 6 runs), not additional broad parameter sweeps.
+
+### 2026-03-05 Cross-Sectional Momentum (CSM) — Full Experiment Log
+
+#### Phase 1: Single-Config Implementation + Walk-Forward
+- Implementation: 9 steps, 23 tests, ruff/mypy clean.
+- Backtest (Aug 2025 – Feb 2026): +7.96% return, Sharpe 1.35, PF 2.77, Max DD -4.08%, 54 trades.
+  - Caveat: PnL concentrated in period-end closes (20 BACKTEST_END trades = 94% of total PnL).
+- Walk-Forward (Jun 2024 – Feb 2026, 3×3): avg return -2.96%, avg Sharpe -1.07, 2/5 profitable.
+  - Window 1 (Sep–Dec 2024): -6.18% — midcap selloff
+  - Window 2 (Dec 2024–Mar 2025): -9.55% — broad crash
+  - Window 3 (Mar–Jun 2025): +1.01% — recovery
+  - Window 4 (Jun–Sep 2025): -4.22% — choppy
+  - Window 5 (Sep–Dec 2025): +4.13% — bull
+- Artifacts:
+  - `reports/backtests/csm_backtest_midcap150_20250801_20260220.json`
+  - `reports/backtests/csm_walk_forward_midcap150_20240601_20260220_3x3.json`
+
+#### Phase 1B: Sensitivity Grid + Crash Protection
+- Grid: 36 configs (top_n=[15,25,35] × lookback=[3,6,9] × trailing=[0.12,0.20] × crash=[on,off])
+  - 12 configs zero-trade (lookback=3 with min_history_days=140 — fixed with adaptive min-history patch)
+  - 24 viable configs: **ALL avg Sharpe < -0.5**
+- Best config: top_n=35, lookback=6, trailing=0.20, crash=ON
+  - avg Sharpe: -0.68, avg return: -1.63%, 2/5 profitable windows
+- Crash protection effect: Improved Sharpe in 8/12 viable pairs, avg delta +0.08. Reduces drawdowns but cannot create alpha where none exists.
+- Per-window pattern (identical across all configs):
+
+| Window | Period | Best Config Return | Regime |
+|--------|--------|-------------------|--------|
+| 1 | Sep–Dec 2024 | -2.38% | Midcap selloff |
+| 2 | Dec 2024–Mar 2025 | -5.99% | Broad crash |
+| 3 | Mar–Jun 2025 | +0.34% | Recovery |
+| 4 | Jun–Sep 2025 | -2.76% | Choppy |
+| 5 | Sep–Dec 2025 | +2.63% | Bull |
+
+- **Kill criterion triggered**: All viable configs have avg Sharpe < -0.5.
+- Artifact: `reports/backtests/csm_sensitivity_grid_full_20240601_20260220.json`
+
+#### Follow-Up Fixes (committed with closure)
+1. **Adaptive min-history**: `run_csm_sensitivity_grid.py` now computes `effective_min_history_days = max(20, (lookback + skip_recent) * 20)` when `--min-history-days 0` (default). Prevents zero-trade configs from lookback=3.
+2. **Viable-only ranking**: Kill criterion and rankings now exclude zero-trade configs. `results_ranked` contains only viable (trade-count > 0) configs.
+3. **pct_change FutureWarning**: `cross_sectional_momentum.py` now passes `fill_method=None` to `pct_change()` to suppress pandas FutureWarning.
+
+#### ML Entry Experiment (Adaptive Trend)
+- LightGBM classifier trained on 12 trade features (ATR ratio, volume ratio, ROC, RSI, weekly EMA spread, etc.)
+- Dataset: 142 trades from Midcap 150 backtest (Aug 2025 – Feb 2026)
+- Result: accuracy 0.54 (barely above coin-flip), AUC 0.53. No actionable lift.
+- Artifact: `reports/ml/ml_entry_experiment_midcap150_adjusteddb_20250801_20260220_v3.json`
+
+#### Corporate Actions Adjustment
+- Implemented multiplicative adjustment for splits and bonuses in `scripts/adjust_corporate_actions.py`.
+- 23 corporate actions applied to backfill database (2024-01-01 to 2026-02-20).
+- Tests in `tests/test_corporate_actions.py`.
+
+### 2026-03-05 PROJECT PAUSED — Conclusion
+
+Both strategy families (Adaptive Trend Following, Cross-Sectional Momentum) fail in the same market windows and succeed in the same windows. The alpha signal is not the differentiator — the market regime is. The problem is structural to the Nifty Midcap 150 universe over this 18-month data window.
+
+**Resumption conditions**: (a) 5+ years of backfill data covering a full bull-bear-bull cycle, OR (b) access to real-time intraday data enabling ORB/VWAP strategies.
 

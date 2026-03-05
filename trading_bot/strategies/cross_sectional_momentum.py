@@ -334,7 +334,7 @@ class CrossSectionalMomentumStrategy(BaseStrategy):
         if pivot.empty:
             return self.target_vol
 
-        returns = pivot.pct_change().replace([np.inf, -np.inf], np.nan)
+        returns = pivot.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
         ew_returns = returns.mean(axis=1, skipna=True).dropna()
         if ew_returns.empty:
             return self.target_vol

@@ -53,6 +53,23 @@ CREATE TABLE IF NOT EXISTS trades (
 CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
 
+CREATE TABLE IF NOT EXISTS corporate_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    action_date TEXT NOT NULL,
+    action_type TEXT NOT NULL,
+    prev_close_db REAL,
+    prev_close_exchange REAL,
+    adjustment_factor REAL NOT NULL,
+    face_val_before REAL,
+    face_val_after REAL,
+    applied INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(symbol, action_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ca_symbol_date ON corporate_actions(symbol, action_date);
+
 CREATE TABLE IF NOT EXISTS portfolio_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     date TEXT NOT NULL UNIQUE,

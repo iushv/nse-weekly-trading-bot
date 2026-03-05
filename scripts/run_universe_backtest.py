@@ -12,6 +12,7 @@ import json
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -24,6 +25,23 @@ def _load_universe(path: Path) -> list[str]:
     raw = path.read_text(encoding="utf-8").splitlines()
     symbols = [line.strip() for line in raw if line.strip() and not line.strip().startswith("#")]
     return [s.replace(".NS", "").upper() for s in symbols]
+
+
+def _json_safe(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return value
 
 
 def main() -> int:
@@ -108,6 +126,9 @@ def main() -> int:
             "avg_days_held": float(avg_hold),
         },
         "regime_summary": res.get("regime_summary", {}),
+        "regime_metrics": res.get("regime_metrics", {}),
+        "data_quality_clean": bool(res.get("data_quality_clean", True)),
+        "data_quality_warnings": res.get("data_quality_warnings", []),
         "exit_breakdown": exit_breakdown,
     }
     if args.include_trades:
@@ -123,6 +144,13 @@ def main() -> int:
                 "net_pnl": float(t.get("net_pnl", 0.0)),
                 "pnl_percent": float(t.get("pnl_percent", 0.0)),
                 "exit_reason": str(t.get("exit_reason", "UNKNOWN")),
+                "entry_regime_label": str(t.get("entry_regime_label", "unknown")),
+                "confidence": float(t.get("confidence", 0.0)),
+                "stop_loss": float(t.get("stop_loss", 0.0)),
+                "target": float(t.get("target", 0.0)),
+                "mfe": float(t.get("mfe", 0.0)),
+                "mae": float(t.get("mae", 0.0)),
+                "metadata": _json_safe(t.get("metadata", {})),
             }
             for t in trades
         ]

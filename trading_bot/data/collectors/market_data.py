@@ -18,12 +18,13 @@ from sqlalchemy import text
 
 from trading_bot.config.constants import MIN_AVG_VOLUME, MIN_MARKET_CAP
 from trading_bot.config.settings import Config
-from trading_bot.data.storage.database import db
+from trading_bot.data.storage.database import Database, db
 from trading_bot.execution.broker_interface import GROWW_DEFAULT_BASE_URL, GrowwHttpClient
 
 
 class MarketDataCollector:
-    def __init__(self, market_data_provider: str | None = None) -> None:
+    def __init__(self, market_data_provider: str | None = None, database: Database | None = None) -> None:
+        self.db = database or db
         self.nifty_500_symbols: list[str] = []
         self.market_data_provider = (
             (market_data_provider or Config.MARKET_DATA_PROVIDER or "auto").strip().lower()
@@ -121,7 +122,7 @@ class MarketDataCollector:
     def _get_latest_price_date(self, symbol: str) -> date | None:
         clean_symbol = self._clean_symbol(symbol)
         query = text("SELECT MAX(date) AS latest_date FROM price_data WHERE symbol = :symbol")
-        with db.engine.connect() as conn:
+        with self.db.engine.connect() as conn:
             latest = conn.execute(query, {"symbol": clean_symbol}).scalar()
         if latest is None:
             return None
@@ -336,6 +337,36 @@ class MarketDataCollector:
             logger.warning(f"Error fetching {symbol} via yfinance fallback download: {exc}")
             return None
 
+    @staticmethod
+    def _normalize_bhavcopy_column(value: str) -> str:
+        return "".join(ch for ch in str(value).strip().lower() if ch.isalnum())
+
+    def _resolve_bhavcopy_columns(self, frame: pd.DataFrame) -> dict[str, str] | None:
+        normalized = {self._normalize_bhavcopy_column(col): str(col) for col in frame.columns}
+        aliases: dict[str, tuple[str, ...]] = {
+            "symbol": ("tckrsymb", "symbol"),
+            "date": ("traddt", "date"),
+            "open": ("opnpric", "open"),
+            "high": ("hghpric", "high"),
+            "low": ("lwpric", "low"),
+            "close": ("clspric", "close"),
+            "volume": ("ttltradgvol", "volume"),
+            "series": ("sctysrs", "series"),
+            "prev_close": ("prvsclsgpric", "prvsclspric", "prevclose"),
+            "face_val": ("fceval", "faceval"),
+        }
+        resolved: dict[str, str] = {}
+        for key, options in aliases.items():
+            for option in options:
+                match = normalized.get(option)
+                if match:
+                    resolved[key] = match
+                    break
+        required = {"symbol", "date", "open", "high", "low", "close", "volume", "series"}
+        if not required.issubset(set(resolved.keys())):
+            return None
+        return resolved
+
     def _fetch_bhavcopy_day(self, trading_date: date) -> pd.DataFrame | None:
         """Download NSE UDiFF bhavcopy for a single trading day. Returns EQ-series DataFrame."""
         date_str = trading_date.strftime("%Y%m%d")
@@ -355,8 +386,30 @@ class MarketDataCollector:
             r.raise_for_status()
             z = zipfile.ZipFile(io.BytesIO(r.content))
             df = pd.read_csv(z.open(z.namelist()[0]))
-            eq = df[df["SctySrs"] == "EQ"][["TckrSymb", "TradDt", "OpnPric", "HghPric", "LwPric", "ClsPric", "TtlTradgVol"]].copy()
+            resolved = self._resolve_bhavcopy_columns(df)
+            if not resolved:
+                logger.warning("Bhavcopy schema mismatch for {}. Columns={}", trading_date, list(df.columns))
+                return None
+            eq = df[df[resolved["series"]] == "EQ"][
+                [
+                    resolved["symbol"],
+                    resolved["date"],
+                    resolved["open"],
+                    resolved["high"],
+                    resolved["low"],
+                    resolved["close"],
+                    resolved["volume"],
+                ]
+            ].copy()
             eq.columns = ["Symbol", "Date", "Open", "High", "Low", "Close", "Volume"]
+            if "prev_close" in resolved:
+                eq["PrevClose"] = pd.to_numeric(df.loc[eq.index, resolved["prev_close"]], errors="coerce")
+            else:
+                eq["PrevClose"] = pd.NA
+            if "face_val" in resolved:
+                eq["FaceVal"] = pd.to_numeric(df.loc[eq.index, resolved["face_val"]], errors="coerce")
+            else:
+                eq["FaceVal"] = pd.NA
             eq["Date"] = pd.to_datetime(eq["Date"])
             self._bhavcopy_cache[date_str] = eq
             return eq
@@ -503,6 +556,294 @@ class MarketDataCollector:
 
         logger.error(f"No historical data source succeeded for {symbol}")
         return None
+
+    @staticmethod
+    def _safe_float(value: Any) -> float | None:
+        try:
+            if pd.isna(value):
+                return None
+            return float(value)
+        except Exception:
+            return None
+
+    def _get_db_previous_close(self, symbol: str, trading_date: date) -> float | None:
+        query = text(
+            """
+            SELECT close
+            FROM price_data
+            WHERE symbol = :symbol AND date < :action_date
+            ORDER BY date DESC
+            LIMIT 1
+            """
+        )
+        with self.db.engine.connect() as conn:
+            value = conn.execute(
+                query,
+                {"symbol": self._clean_symbol(symbol), "action_date": str(trading_date)},
+            ).scalar()
+        return self._safe_float(value)
+
+    def _get_previous_face_value(self, symbol: str, trading_date: date, max_lookback_days: int = 7) -> float | None:
+        clean_symbol = self._clean_symbol(symbol)
+        for delta in range(1, max_lookback_days + 1):
+            prev_day = trading_date - timedelta(days=delta)
+            if prev_day.weekday() >= 5:
+                continue
+            day_df = self._fetch_bhavcopy_day(prev_day)
+            if day_df is None or day_df.empty or "FaceVal" not in day_df.columns:
+                continue
+            row = day_df[day_df["Symbol"] == clean_symbol]
+            if row.empty:
+                continue
+            value = self._safe_float(row.iloc[0].get("FaceVal"))
+            if value is not None and value > 0:
+                return value
+        return None
+
+    @staticmethod
+    def _is_bonus_ratio(value: float, tolerance: float = 0.02) -> bool:
+        if value < 1.4:
+            return False
+        near_integer = abs(value - round(value)) <= tolerance and round(value) >= 2
+        doubled = value * 2.0
+        near_half_step = abs(doubled - round(doubled)) <= tolerance and round(doubled) >= 3
+        return bool(near_integer or near_half_step)
+
+    @staticmethod
+    def _is_likely_split_ratio(value: float, tolerance: float = 0.04) -> bool:
+        if value < 1.8:
+            return False
+        canonical = [2.0, 2.5, 3.0, 4.0, 5.0, 10.0]
+        return any(abs(value - base) <= tolerance * base for base in canonical)
+
+    def _classify_corporate_action(
+        self,
+        *,
+        adjustment_factor: float,
+        face_val_before: float | None,
+        face_val_after: float | None,
+        factor_source: str,
+    ) -> str:
+        if face_val_before is not None and face_val_after is not None and abs(face_val_before - face_val_after) > 1e-9:
+            return "split"
+        if factor_source == "prev_close_ratio" and self._is_bonus_ratio(adjustment_factor):
+            return "bonus"
+        if self._is_likely_split_ratio(adjustment_factor):
+            return "likely_split"
+        return "unknown"
+
+    def detect_corporate_actions_for_day(
+        self,
+        trading_date: date,
+        *,
+        symbols: list[str] | set[str] | None = None,
+        detect_threshold: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Compare bhavcopy PrevClose with DB prior close to detect corporate actions."""
+        day_df = self._fetch_bhavcopy_day(trading_date)
+        if day_df is None or day_df.empty or "PrevClose" not in day_df.columns:
+            return []
+
+        threshold = float(
+            detect_threshold if detect_threshold is not None else Config.CORPORATE_ACTION_DETECT_THRESHOLD
+        )
+        if symbols:
+            allowed = {self._clean_symbol(sym) for sym in symbols}
+            day_df = day_df[day_df["Symbol"].isin(allowed)]
+
+        actions: list[dict[str, Any]] = []
+        for _, row in day_df.iterrows():
+            symbol = self._clean_symbol(str(row.get("Symbol", "")))
+            exchange_prev = self._safe_float(row.get("PrevClose"))
+            if not symbol or exchange_prev is None or exchange_prev <= 0:
+                continue
+
+            db_prev = self._get_db_previous_close(symbol, trading_date)
+            if db_prev is None or db_prev <= 0:
+                continue
+
+            adjustment_factor = db_prev / exchange_prev
+            factor_source = "prev_close_ratio"
+            if abs(adjustment_factor - 1.0) < threshold:
+                current_close = self._safe_float(row.get("Close"))
+                if current_close is None or current_close <= 0:
+                    continue
+                jump_pct = abs((current_close - exchange_prev) / exchange_prev)
+                fallback_threshold = max(threshold * 10.0, Config.CORPORATE_ACTION_VERIFY_JUMP_THRESHOLD)
+                if jump_pct < fallback_threshold:
+                    continue
+                adjustment_factor = exchange_prev / current_close
+                factor_source = "price_jump_fallback"
+
+            face_val_after = self._safe_float(row.get("FaceVal"))
+            face_val_before = self._get_previous_face_value(symbol, trading_date)
+            action_type = self._classify_corporate_action(
+                adjustment_factor=adjustment_factor,
+                face_val_before=face_val_before,
+                face_val_after=face_val_after,
+                factor_source=factor_source,
+            )
+            actions.append(
+                {
+                    "symbol": symbol,
+                    "action_date": str(trading_date),
+                    "action_type": action_type,
+                    "prev_close_db": float(db_prev),
+                    "prev_close_exchange": float(exchange_prev),
+                    "adjustment_factor": round(float(adjustment_factor), 6),
+                    "face_val_before": face_val_before,
+                    "face_val_after": face_val_after,
+                    "factor_source": factor_source,
+                    "applied": 0,
+                }
+            )
+        return actions
+
+    def should_auto_apply_action(self, action: dict[str, Any], *, apply_threshold: float | None = None) -> bool:
+        threshold = float(
+            apply_threshold if apply_threshold is not None else Config.CORPORATE_ACTION_APPLY_THRESHOLD
+        )
+        factor = self._safe_float(action.get("adjustment_factor"))
+        if factor is None or factor <= 0 or abs(factor - 1.0) < threshold:
+            return False
+        action_type = str(action.get("action_type", "")).strip().lower()
+        face_before = self._safe_float(action.get("face_val_before"))
+        face_after = self._safe_float(action.get("face_val_after"))
+
+        if action_type == "split":
+            return face_before is not None and face_after is not None and abs(face_before - face_after) > 1e-9
+        if action_type == "bonus":
+            if face_before is None or face_after is None:
+                return False
+            if abs(face_before - face_after) > 1e-9:
+                return False
+            return self._is_bonus_ratio(factor)
+        return False
+
+    def apply_corporate_actions(
+        self,
+        actions: list[dict[str, Any]],
+        *,
+        dry_run: bool = False,
+        apply_threshold: float | None = None,
+    ) -> dict[str, Any]:
+        ordered_actions = sorted(
+            [dict(item) for item in actions if isinstance(item, dict)],
+            key=lambda item: (str(item.get("action_date", "")), str(item.get("symbol", ""))),
+        )
+        summary: dict[str, Any] = {
+            "detected": len(ordered_actions),
+            "eligible": 0,
+            "applied": 0,
+            "rows_updated": 0,
+            "skipped": 0,
+            "applied_actions": [],
+            "skipped_actions": [],
+        }
+        for action in ordered_actions:
+            if not self.should_auto_apply_action(action, apply_threshold=apply_threshold):
+                summary["skipped"] = int(summary["skipped"]) + 1
+                summary["skipped_actions"].append(action)
+                continue
+
+            summary["eligible"] = int(summary["eligible"]) + 1
+            if dry_run:
+                summary["applied_actions"].append({**action, "rows_updated": 0})
+                continue
+
+            rows = self.db.apply_backward_adjustment(
+                symbol=str(action.get("symbol", "")),
+                action_date=str(action.get("action_date", "")),
+                adjustment_factor=float(action.get("adjustment_factor", 1.0)),
+            )
+            self.db.mark_corporate_action_applied(
+                symbol=str(action.get("symbol", "")),
+                action_date=str(action.get("action_date", "")),
+            )
+            summary["applied"] = int(summary["applied"]) + 1
+            summary["rows_updated"] = int(summary["rows_updated"]) + int(rows)
+            summary["applied_actions"].append({**action, "rows_updated": int(rows)})
+        return summary
+
+    def detect_corporate_actions_for_range(
+        self,
+        *,
+        start_date: date,
+        end_date: date,
+        symbols: list[str] | set[str] | None = None,
+        detect_threshold: float | None = None,
+    ) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        current = start_date
+        while current <= end_date:
+            if current.weekday() < 5:
+                out.extend(
+                    self.detect_corporate_actions_for_day(
+                        current,
+                        symbols=symbols,
+                        detect_threshold=detect_threshold,
+                    )
+                )
+            current += timedelta(days=1)
+        return out
+
+    def scan_overnight_jumps(
+        self,
+        *,
+        start_date: date,
+        end_date: date,
+        symbols: list[str] | set[str] | None = None,
+        threshold_pct: float | None = None,
+    ) -> list[dict[str, Any]]:
+        threshold = float(
+            threshold_pct if threshold_pct is not None else Config.CORPORATE_ACTION_VERIFY_JUMP_THRESHOLD
+        )
+        lookback_start = start_date - timedelta(days=14)
+        params: dict[str, Any] = {"start_date": str(lookback_start), "end_date": str(end_date)}
+        where = ["date >= :start_date", "date <= :end_date"]
+        if symbols:
+            symbol_params: list[str] = []
+            for idx, symbol in enumerate(sorted({self._clean_symbol(sym) for sym in symbols})):
+                key = f"sym_{idx}"
+                symbol_params.append(f":{key}")
+                params[key] = symbol
+            where.append(f"symbol IN ({', '.join(symbol_params)})")
+        query = text(
+            f"""
+            SELECT symbol, date, close
+            FROM price_data
+            WHERE {' AND '.join(where)}
+            ORDER BY symbol, date
+            """
+        )
+        frame = pd.read_sql(query, self.db.engine, params=params)
+        if frame.empty:
+            return []
+        frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+        frame = frame.dropna(subset=["date", "close"]).sort_values(["symbol", "date"])
+        frame["prev_close"] = frame.groupby("symbol", sort=False)["close"].shift(1)
+        frame = frame.dropna(subset=["prev_close"])
+        frame["pct_change"] = (frame["close"] - frame["prev_close"]) / frame["prev_close"]
+        target_start = pd.Timestamp(start_date)
+        target_end = pd.Timestamp(end_date)
+        flagged = frame[
+            (frame["date"] >= target_start)
+            & (frame["date"] <= target_end)
+            & (frame["pct_change"].abs() > threshold)
+        ]
+        warnings: list[dict[str, Any]] = []
+        for _, row in flagged.iterrows():
+            warnings.append(
+                {
+                    "symbol": str(row["symbol"]),
+                    "date": str(pd.Timestamp(row["date"]).date()),
+                    "prev_close": float(row["prev_close"]),
+                    "current_close": float(row["close"]),
+                    "pct_change": float(row["pct_change"]),
+                    "threshold_pct": float(threshold),
+                }
+            )
+        return warnings
 
     def _calculate_atr(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
         high_low = df["High"] - df["Low"]
@@ -663,6 +1004,14 @@ class MarketDataCollector:
                 "skipped_fresh": skipped_fresh,
                 "failed_symbols": 0,
                 "unresolved_symbols": [],
+                "corporate_actions": {
+                    "enabled": bool(Config.CORPORATE_ACTION_AUTO_ADJUST_ENABLED),
+                    "detected": 0,
+                    "pending_before_apply": 0,
+                    "eligible": 0,
+                    "applied": 0,
+                    "rows_updated": 0,
+                },
             }
 
         updated_symbols = 0
@@ -678,7 +1027,7 @@ class MarketDataCollector:
             for sym, df in batch.items():
                 try:
                     if df is not None and not df.empty:
-                        db.insert_price_data(df, sym)
+                        self.db.insert_price_data(df, sym)
                         latest_after = self._get_latest_price_date(sym)
                         if latest_after is not None and latest_after >= freshness_threshold:
                             updated_symbols += 1
@@ -692,7 +1041,7 @@ class MarketDataCollector:
             try:
                 df = self.fetch_historical_data(symbol, start_date=fetch_start)
                 if df is not None and not df.empty:
-                    db.insert_price_data(df, symbol)
+                    self.db.insert_price_data(df, symbol)
                     latest_after = self._get_latest_price_date(symbol)
                     if latest_after is not None and latest_after >= freshness_threshold:
                         updated_symbols += 1
@@ -721,6 +1070,39 @@ class MarketDataCollector:
             skipped_fresh,
             failed_symbols,
         )
+        corporate_actions_summary: dict[str, Any] = {
+            "enabled": bool(Config.CORPORATE_ACTION_AUTO_ADJUST_ENABLED),
+            "detected": 0,
+            "pending_before_apply": 0,
+            "eligible": 0,
+            "applied": 0,
+            "rows_updated": 0,
+        }
+        if Config.CORPORATE_ACTION_AUTO_ADJUST_ENABLED:
+            detected_actions = self.detect_corporate_actions_for_range(
+                start_date=fetch_start,
+                end_date=today,
+                symbols=symbols,
+                detect_threshold=Config.CORPORATE_ACTION_DETECT_THRESHOLD,
+            )
+            corporate_actions_summary["detected"] = len(detected_actions)
+            if detected_actions:
+                self.db.upsert_corporate_actions(detected_actions)
+                pending_actions = self.db.list_corporate_actions(
+                    start_date=str(fetch_start),
+                    end_date=str(today),
+                    symbols=[self._clean_symbol(sym) for sym in symbols],
+                    applied=0,
+                )
+                corporate_actions_summary["pending_before_apply"] = len(pending_actions)
+                applied_summary = self.apply_corporate_actions(
+                    pending_actions,
+                    dry_run=False,
+                    apply_threshold=Config.CORPORATE_ACTION_APPLY_THRESHOLD,
+                )
+                corporate_actions_summary["eligible"] = int(applied_summary.get("eligible", 0))
+                corporate_actions_summary["applied"] = int(applied_summary.get("applied", 0))
+                corporate_actions_summary["rows_updated"] = int(applied_summary.get("rows_updated", 0))
         return {
             "symbols": len(symbols),
             "required_latest_date": str(freshness_threshold),
@@ -728,6 +1110,7 @@ class MarketDataCollector:
             "skipped_fresh": skipped_fresh,
             "failed_symbols": failed_symbols,
             "unresolved_symbols": unresolved_symbols,
+            "corporate_actions": corporate_actions_summary,
         }
 
     def backfill_historical_data(self, symbols: list[str], start_date: str = "2020-01-01") -> None:
@@ -736,7 +1119,7 @@ class MarketDataCollector:
             try:
                 df = self.fetch_historical_data(symbol, start_date=start_date)
                 if df is not None and not df.empty:
-                    db.insert_price_data(df, symbol)
+                    self.db.insert_price_data(df, symbol)
                     logger.info(f"[{idx}/{len(symbols)}] Backfilled {symbol}")
             except Exception as exc:
                 logger.error(f"Backfill failed for {symbol}: {exc}")

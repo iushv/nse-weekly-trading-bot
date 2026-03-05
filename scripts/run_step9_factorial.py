@@ -12,11 +12,23 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from trading_bot.config.settings import Config
+
+
 BACKTEST_SCRIPT = ROOT / "scripts" / "run_universe_backtest.py"
 WALK_FORWARD_SCRIPT = ROOT / "scripts" / "run_universe_walk_forward.py"
 REPORTS_DIR = ROOT / "reports" / "backtests"
+REDACTION_TOKENS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD")
+FAVORABLE_MIN_DAYS = 30
+FAVORABLE_MIN_TRADES = 10
+FAVORABLE_PF_MIN = 1.2
+FAVORABLE_SHARPE_MIN = 0.3
+DEFENSIVE_MAX_LOSS_PCT_CAPITAL = 0.02
+SINGLE_STOP_LOSS_MAX_PCT_CAPITAL = 0.02
 
 
 def _parse_csv_floats(raw: str) -> list[float]:
@@ -53,6 +65,86 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    return str(value)
+
+
+def _is_sensitive_config_key(key: str) -> bool:
+    upper = key.upper()
+    return any(token in upper for token in REDACTION_TOKENS)
+
+
+def _redacted_config_snapshot() -> dict[str, Any]:
+    snapshot: dict[str, Any] = {}
+    for key in sorted(dir(Config)):
+        if not key.isupper():
+            continue
+        value = getattr(Config, key)
+        if callable(value):
+            continue
+        if _is_sensitive_config_key(key):
+            snapshot[key] = "<REDACTED>"
+            continue
+        snapshot[key] = _json_safe(value)
+    return snapshot
+
+
+def _git_metadata() -> dict[str, Any]:
+    commit_sha = "unknown"
+    dirty: bool | None = None
+    branch = "unknown"
+
+    try:
+        sha_proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        commit_sha = sha_proc.stdout.strip() or "unknown"
+    except Exception:
+        commit_sha = "unknown"
+
+    try:
+        branch_proc = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        branch = branch_proc.stdout.strip() or "unknown"
+    except Exception:
+        branch = "unknown"
+
+    try:
+        dirty_proc = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        dirty = bool(dirty_proc.stdout.strip())
+    except Exception:
+        dirty = None
+
+    return {
+        "commit_sha": commit_sha,
+        "branch": branch,
+        "is_dirty": dirty,
+    }
 
 
 def _contexts_compatible(existing: dict[str, Any], current: dict[str, Any]) -> bool:
@@ -186,10 +278,28 @@ def _validate_walk_forward_payload(
         )
 
 
-def _extract_metrics(payload: dict[str, Any]) -> dict[str, float]:
+def _extract_metrics(payload: dict[str, Any], *, capital: float) -> dict[str, Any]:
     metrics = payload.get("metrics", {}) if isinstance(payload.get("metrics"), dict) else {}
     exit_breakdown = payload.get("exit_breakdown", {}) if isinstance(payload.get("exit_breakdown"), dict) else {}
     stop_loss = exit_breakdown.get("STOP_LOSS", {}) if isinstance(exit_breakdown.get("STOP_LOSS"), dict) else {}
+    regime_metrics = payload.get("regime_metrics", {}) if isinstance(payload.get("regime_metrics"), dict) else {}
+    daily_by_regime = (
+        regime_metrics.get("daily_returns_by_regime", {})
+        if isinstance(regime_metrics.get("daily_returns_by_regime"), dict)
+        else {}
+    )
+    entry_regime_metrics = (
+        regime_metrics.get("entry_regime_trade_metrics", {})
+        if isinstance(regime_metrics.get("entry_regime_trade_metrics"), dict)
+        else {}
+    )
+    favorable_daily = daily_by_regime.get("favorable", {}) if isinstance(daily_by_regime.get("favorable"), dict) else {}
+    favorable_entry = entry_regime_metrics.get("favorable", {}) if isinstance(entry_regime_metrics.get("favorable"), dict) else {}
+    defensive_entry = entry_regime_metrics.get("defensive", {}) if isinstance(entry_regime_metrics.get("defensive"), dict) else {}
+    defensive_total_pnl = float(defensive_entry.get("total_pnl", 0.0) or 0.0)
+    data_quality_clean = bool(payload.get("data_quality_clean", True))
+    raw_warnings = payload.get("data_quality_warnings", [])
+    warning_count = len(raw_warnings) if isinstance(raw_warnings, list) else 0
     return {
         "sharpe": float(metrics.get("sharpe_ratio", 0.0)),
         "pf": float(metrics.get("profit_factor_closed", 0.0)),
@@ -197,22 +307,96 @@ def _extract_metrics(payload: dict[str, Any]) -> dict[str, float]:
         "max_dd": float(metrics.get("max_drawdown", 0.0)),
         "total_pnl": float(metrics.get("total_pnl", 0.0)),
         "stop_loss_total_pnl": float(stop_loss.get("total_pnl", 0.0)),
+        "favorable_days": float(favorable_daily.get("days", 0) or 0),
+        "favorable_trades": float(favorable_entry.get("trades", 0) or 0),
+        "favorable_sharpe": float(favorable_daily.get("sharpe_ratio", 0.0) or 0.0),
+        "favorable_pf": float(favorable_entry.get("profit_factor", 0.0) or 0.0),
+        "defensive_total_pnl": defensive_total_pnl,
+        "defensive_total_pnl_pct_capital": (defensive_total_pnl / capital) if capital > 0 else 0.0,
+        "single_stop_loss_max_abs": float(regime_metrics.get("single_stop_loss_max_abs", 0.0) or 0.0),
+        "single_stop_loss_max_pct_capital": float(
+            regime_metrics.get("single_stop_loss_max_pct_capital", 0.0) or 0.0
+        ),
+        "unknown_days": float(regime_metrics.get("unknown_days", 0) or 0),
+        "unknown_trades": float(regime_metrics.get("unknown_trades", 0) or 0),
+        "data_quality_clean": data_quality_clean,
+        "data_quality_warning_count": float(warning_count),
     }
 
 
-def _gate_failures(candidate: dict[str, float], baseline_stop_loss: float) -> list[str]:
+def _evaluate_regime_gates(candidate: dict[str, Any]) -> tuple[list[str], dict[str, dict[str, Any]]]:
     failures: list[str] = []
-    if candidate["pf"] < 0.85:
-        failures.append("pf_below_0.85")
-    if candidate["sharpe"] < -0.30:
-        failures.append("sharpe_below_-0.30")
-    if candidate["trades"] < 40 or candidate["trades"] > 70:
-        failures.append("trades_outside_40_70")
-    if baseline_stop_loss < 0:
-        worst_allowed = baseline_stop_loss * 1.2
-        if candidate["stop_loss_total_pnl"] < worst_allowed:
-            failures.append("stop_loss_pnl_worse_than_20pct_vs_baseline")
-    return failures
+    details: dict[str, dict[str, Any]] = {}
+
+    data_quality_clean = bool(candidate.get("data_quality_clean", True))
+    warning_count = int(candidate.get("data_quality_warning_count", 0) or 0)
+    details["data_quality_clean"] = {
+        "status": "passed" if data_quality_clean else "failed",
+        "warning_count": warning_count,
+    }
+    if not data_quality_clean:
+        failures.append("data_quality_failed")
+
+    favorable_days = int(candidate.get("favorable_days", 0) or 0)
+    favorable_trades = int(candidate.get("favorable_trades", 0) or 0)
+    sufficient_samples = (favorable_days >= FAVORABLE_MIN_DAYS) and (favorable_trades >= FAVORABLE_MIN_TRADES)
+
+    if sufficient_samples:
+        favorable_pf = float(candidate.get("favorable_pf", 0.0) or 0.0)
+        pf_ok = favorable_pf >= FAVORABLE_PF_MIN
+        details["favorable_pf_ge_1_2"] = {
+            "status": "passed" if pf_ok else "failed",
+            "actual": favorable_pf,
+            "threshold": FAVORABLE_PF_MIN,
+            "favorable_days": favorable_days,
+            "favorable_trades": favorable_trades,
+        }
+        if not pf_ok:
+            failures.append("favorable_pf_below_1.2")
+
+        favorable_sharpe = float(candidate.get("favorable_sharpe", 0.0) or 0.0)
+        sharpe_ok = favorable_sharpe > FAVORABLE_SHARPE_MIN
+        details["favorable_sharpe_gt_0_3"] = {
+            "status": "passed" if sharpe_ok else "failed",
+            "actual": favorable_sharpe,
+            "threshold": FAVORABLE_SHARPE_MIN,
+            "favorable_days": favorable_days,
+            "favorable_trades": favorable_trades,
+        }
+        if not sharpe_ok:
+            failures.append("favorable_sharpe_not_above_0.3")
+    else:
+        skipped_payload = {
+            "status": "skipped_insufficient_data",
+            "favorable_days": favorable_days,
+            "favorable_trades": favorable_trades,
+            "required_favorable_days": FAVORABLE_MIN_DAYS,
+            "required_favorable_trades": FAVORABLE_MIN_TRADES,
+        }
+        details["favorable_pf_ge_1_2"] = dict(skipped_payload)
+        details["favorable_sharpe_gt_0_3"] = dict(skipped_payload)
+
+    defensive_pnl_pct = float(candidate.get("defensive_total_pnl_pct_capital", 0.0) or 0.0)
+    defensive_ok = defensive_pnl_pct >= (-DEFENSIVE_MAX_LOSS_PCT_CAPITAL)
+    details["defensive_loss_cap"] = {
+        "status": "passed" if defensive_ok else "failed",
+        "actual_pct_capital": defensive_pnl_pct,
+        "threshold_min_pct_capital": -DEFENSIVE_MAX_LOSS_PCT_CAPITAL,
+    }
+    if not defensive_ok:
+        failures.append("defensive_loss_cap_breached")
+
+    single_stop_loss_max_pct = float(candidate.get("single_stop_loss_max_pct_capital", 0.0) or 0.0)
+    single_stop_ok = single_stop_loss_max_pct < SINGLE_STOP_LOSS_MAX_PCT_CAPITAL
+    details["single_stop_loss_max_lt_2pct"] = {
+        "status": "passed" if single_stop_ok else "failed",
+        "actual_pct_capital": single_stop_loss_max_pct,
+        "threshold_lt_pct_capital": SINGLE_STOP_LOSS_MAX_PCT_CAPITAL,
+    }
+    if not single_stop_ok:
+        failures.append("single_stop_loss_max_ge_2pct_capital")
+
+    return failures, details
 
 
 def _rank_key(run: dict[str, Any]) -> tuple[float, float, float, float]:
@@ -281,7 +465,7 @@ def _run_universe_backtest(
         "end": end,
         "artifact": str(out_path.relative_to(ROOT)),
         "env_overrides": dict(env_overrides),
-        "metrics": _extract_metrics(payload),
+        "metrics": _extract_metrics(payload, capital=capital),
         "elapsed_sec": float(elapsed),
     }
 
@@ -364,6 +548,7 @@ def _run_or_resume_universe_backtest(
     env_overrides: dict[str, str],
     run_dir: Path,
     heartbeat_sec: int,
+    allow_meta_mismatch_rerun: bool = False,
 ) -> dict[str, Any]:
     out_path = run_dir / f"{label}.json"
     meta_path = run_dir / f"{label}.meta.json"
@@ -378,38 +563,44 @@ def _run_or_resume_universe_backtest(
     }
 
     if out_path.exists():
+        can_resume = True
         if meta_path.exists():
             existing_meta = _read_json(meta_path)
             if existing_meta != expected_meta:
-                raise ValueError(
-                    f"Resume metadata mismatch for {label} in {meta_path}. "
-                    "Start a fresh run or use matching parameters."
-                )
-        payload = _read_json(out_path)
-        _validate_backtest_payload(
-            payload,
-            label=label,
-            expected_start=start,
-            expected_end=end,
-            expected_universe_file=universe_file,
-            expected_include_regime=not no_regime,
-        )
-        run = {
-            "label": label,
-            "start": start,
-            "end": end,
-            "artifact": str(out_path.relative_to(ROOT)),
-            "env_overrides": dict(env_overrides),
-            "metrics": _extract_metrics(payload),
-            "elapsed_sec": 0.0,
-            "resumed": True,
-        }
-        _log(
-            f"{step_tag}: resumed existing artifact "
-            f"(sharpe={run['metrics']['sharpe']:.4f}, pf={run['metrics']['pf']:.4f}, "
-            f"trades={int(run['metrics']['trades'])})"
-        )
-        return run
+                if allow_meta_mismatch_rerun:
+                    can_resume = False
+                    _log(f"{step_tag}: metadata mismatch detected; rerunning and overwriting prior artifact.")
+                else:
+                    raise ValueError(
+                        f"Resume metadata mismatch for {label} in {meta_path}. "
+                        "Start a fresh run or use matching parameters."
+                    )
+        if can_resume:
+            payload = _read_json(out_path)
+            _validate_backtest_payload(
+                payload,
+                label=label,
+                expected_start=start,
+                expected_end=end,
+                expected_universe_file=universe_file,
+                expected_include_regime=not no_regime,
+            )
+            run = {
+                "label": label,
+                "start": start,
+                "end": end,
+                "artifact": str(out_path.relative_to(ROOT)),
+                "env_overrides": dict(env_overrides),
+                "metrics": _extract_metrics(payload, capital=capital),
+                "elapsed_sec": 0.0,
+                "resumed": True,
+            }
+            _log(
+                f"{step_tag}: resumed existing artifact "
+                f"(sharpe={run['metrics']['sharpe']:.4f}, pf={run['metrics']['pf']:.4f}, "
+                f"trades={int(run['metrics']['trades'])})"
+            )
+            return run
 
     _log(
         f"{step_tag}: running backtest {start}..{end} | "
@@ -449,6 +640,7 @@ def _run_or_resume_walk_forward(
     env_overrides: dict[str, str],
     run_dir: Path,
     heartbeat_sec: int,
+    allow_meta_mismatch_rerun: bool = False,
 ) -> dict[str, Any]:
     out_path = run_dir / f"{label}_walk_forward.json"
     meta_path = run_dir / f"{label}_walk_forward.meta.json"
@@ -464,41 +656,47 @@ def _run_or_resume_walk_forward(
     }
 
     if out_path.exists():
+        can_resume = True
         if meta_path.exists():
             existing_meta = _read_json(meta_path)
             if existing_meta != expected_meta:
-                raise ValueError(
-                    f"Resume metadata mismatch for {label}_walk_forward in {meta_path}. "
-                    "Start a fresh run or use matching parameters."
-                )
-        payload = _read_json(out_path)
-        _validate_walk_forward_payload(
-            payload,
-            label=f"{label}_walk_forward",
-            expected_start=start,
-            expected_end=end,
-            expected_universe_file=universe_file,
-            expected_train_months=train_months,
-            expected_test_months=test_months,
-        )
-        summary = payload.get("summary", {}) if isinstance(payload.get("summary"), dict) else {}
-        run = {
-            "artifact": str(out_path.relative_to(ROOT)),
-            "summary": {
-                "avg_return": float(summary.get("avg_return", 0.0) or 0.0),
-                "avg_sharpe": float(summary.get("avg_sharpe", 0.0) or 0.0),
-                "avg_max_dd": float(summary.get("avg_max_dd", 0.0) or 0.0),
-                "consistency": float(summary.get("consistency", 0.0) or 0.0),
-                "total_windows": int(summary.get("total_windows", 0) or 0),
-            },
-            "elapsed_sec": 0.0,
-            "resumed": True,
-        }
-        _log(
-            f"{step_tag}: resumed existing artifact "
-            f"(avg_sharpe={run['summary']['avg_sharpe']:.4f}, windows={run['summary']['total_windows']})"
-        )
-        return run
+                if allow_meta_mismatch_rerun:
+                    can_resume = False
+                    _log(f"{step_tag}: metadata mismatch detected; rerunning and overwriting prior artifact.")
+                else:
+                    raise ValueError(
+                        f"Resume metadata mismatch for {label}_walk_forward in {meta_path}. "
+                        "Start a fresh run or use matching parameters."
+                    )
+        if can_resume:
+            payload = _read_json(out_path)
+            _validate_walk_forward_payload(
+                payload,
+                label=f"{label}_walk_forward",
+                expected_start=start,
+                expected_end=end,
+                expected_universe_file=universe_file,
+                expected_train_months=train_months,
+                expected_test_months=test_months,
+            )
+            summary = payload.get("summary", {}) if isinstance(payload.get("summary"), dict) else {}
+            run = {
+                "artifact": str(out_path.relative_to(ROOT)),
+                "summary": {
+                    "avg_return": float(summary.get("avg_return", 0.0) or 0.0),
+                    "avg_sharpe": float(summary.get("avg_sharpe", 0.0) or 0.0),
+                    "avg_max_dd": float(summary.get("avg_max_dd", 0.0) or 0.0),
+                    "consistency": float(summary.get("consistency", 0.0) or 0.0),
+                    "total_windows": int(summary.get("total_windows", 0) or 0),
+                },
+                "elapsed_sec": 0.0,
+                "resumed": True,
+            }
+            _log(
+                f"{step_tag}: resumed existing artifact "
+                f"(avg_sharpe={run['summary']['avg_sharpe']:.4f}, windows={run['summary']['total_windows']})"
+            )
+            return run
 
     _log(
         f"{step_tag}: running walk-forward {start}..{end} "
@@ -653,7 +851,6 @@ def main() -> int:
     )
     runs.append(baseline)
     resumed_steps += int(bool(baseline.get("resumed")))
-    baseline_stop_loss = baseline["metrics"]["stop_loss_total_pnl"]
 
     candidates: list[dict[str, Any]] = []
     workers = max(1, int(args.max_workers))
@@ -692,8 +889,9 @@ def main() -> int:
 
     for idx, _overrides in sorted(factorial_specs, key=lambda item: item[0]):
         run = factorial_results[idx]
-        gate_failures = _gate_failures(run["metrics"], baseline_stop_loss)
+        gate_failures, gate_details = _evaluate_regime_gates(run["metrics"])
         run["gate_failures"] = gate_failures
+        run["gate_details"] = gate_details
         run["passed_gates"] = not gate_failures
         runs.append(run)
         resumed_steps += int(bool(run.get("resumed")))
@@ -722,6 +920,7 @@ def main() -> int:
         env_overrides=best["env_overrides"],
         run_dir=run_dir,
         heartbeat_sec=args.heartbeat_sec,
+        allow_meta_mismatch_rerun=True,
     )
     runs.append(retest)
     resumed_steps += int(bool(retest.get("resumed")))
@@ -738,6 +937,7 @@ def main() -> int:
         env_overrides=best["env_overrides"],
         run_dir=run_dir,
         heartbeat_sec=args.heartbeat_sec,
+        allow_meta_mismatch_rerun=True,
     )
     runs.append(holdout)
     resumed_steps += int(bool(holdout.get("resumed")))
@@ -754,6 +954,7 @@ def main() -> int:
         env_overrides=best["env_overrides"],
         run_dir=run_dir,
         heartbeat_sec=args.heartbeat_sec,
+        allow_meta_mismatch_rerun=True,
     )
     resumed_steps += int(bool(walk.get("resumed")))
 
@@ -765,6 +966,12 @@ def main() -> int:
         "walk_forward_avg_sharpe_gt_0": float(walk["summary"]["avg_sharpe"]) > 0.0,
     }
     accepted = all(bool(v) for v in decision_checks.values())
+    reproducibility = {
+        "git": _git_metadata(),
+        "config_snapshot": _redacted_config_snapshot(),
+        "redaction_tokens": list(REDACTION_TOKENS),
+        "per_run_env_overrides_recorded": True,
+    }
 
     output = {
         "generated_at": datetime.utcnow().isoformat() + "Z",
@@ -772,6 +979,14 @@ def main() -> int:
         "run_budget": 12,
         "run_dir": str(run_dir.relative_to(ROOT)),
         "resumed_steps": int(resumed_steps),
+        "gate_policy": {
+            "favorable_min_days": FAVORABLE_MIN_DAYS,
+            "favorable_min_trades": FAVORABLE_MIN_TRADES,
+            "favorable_pf_min": FAVORABLE_PF_MIN,
+            "favorable_sharpe_min": FAVORABLE_SHARPE_MIN,
+            "defensive_max_loss_pct_capital": DEFENSIVE_MAX_LOSS_PCT_CAPITAL,
+            "single_stop_loss_max_pct_capital": SINGLE_STOP_LOSS_MAX_PCT_CAPITAL,
+        },
         "config": {
             "start": args.start,
             "end": args.end,
@@ -789,6 +1004,7 @@ def main() -> int:
                 "ADAPTIVE_TREND_STOP_ATR_MULT": stop_mult_values,
             },
         },
+        "reproducibility": reproducibility,
         "baseline": baseline,
         "ranked_candidates": ranked,
         "selected_best": best,

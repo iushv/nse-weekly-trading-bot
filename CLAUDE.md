@@ -156,16 +156,21 @@ Set in `.env` (see `.env.example` for full list):
 - Run a single test: `pytest tests/test_adaptive_trend_strategy.py::test_name -v`
 - Some tests require `PYTHONPATH=.` if running outside the venv
 
-## Current State
+## Current State — PROJECT PAUSED (2026-03-05)
 
-- **Active universe**: Nifty Midcap 150 (pivoted from Nifty 50 due to near-zero edge), 151 symbols
-- **Data source**: NSE UDiFF Bhavcopy (`MARKET_DATA_PROVIDER=bhavcopy`). Database fully backfilled 2024-01-01 → 2026-02-14.
-- **Backtest performance** (Midcap 150, Aug 2025-Feb 2026): +7.54% return, Sharpe 1.42, PF 1.94
-- **Walk-forward** (3x3, Jan 2024-Feb 2026): 4/7 profitable windows, avg +0.90%
-- **Paper-run status**: Running, streak counter at 0/4
-- **Phase 9 robustness**: 3/4 anchors as of 2026-02-13
-- **ML layer** (Phase 9E-9F): Not yet implemented; collecting features only
-- **Live trading**: Disabled; requires 4/4 weekly promotion gates + manual review
+Two independent strategy families (Adaptive Trend Following, Cross-Sectional Momentum) exhaustively tested on Nifty Midcap 150 over Jun 2024 – Feb 2026. Neither produces positive walk-forward alpha. The binding constraint is the opportunity set (universe + data window), not the signal.
+
+**Resumption conditions**: (a) 5+ years of backfill data covering a full bull-bear-bull cycle, OR (b) access to real-time intraday data enabling ORB/VWAP strategies.
+
+- **Active universe**: Nifty Midcap 150, 151 symbols
+- **Data source**: NSE UDiFF Bhavcopy (`MARKET_DATA_PROVIDER=bhavcopy`). Backfilled 2024-01-01 → 2026-02-20.
+- **Adaptive Trend Following**: RETIRED. 100+ experiments, 4 Step 9 factorial cycles. Best walk-forward avg Sharpe -0.18.
+- **Cross-Sectional Momentum**: EXHAUSTED. 36-config sensitivity grid, all viable configs avg Sharpe < -0.5. Kill criterion triggered.
+- **Key finding**: Both strategies fail in the same windows (Q4 2024 – Q1 2025 selloff, Q3 2025 chop) and succeed in the same windows. The problem is structural to the Midcap 150 universe over this 18-month data window.
+- **Paper-run status**: Stopped. No strategy has positive walk-forward alpha.
+- **ML entry experiment**: Completed; no actionable lift found.
+- **Live trading**: Disabled; no strategy qualifies.
+- **Infrastructure**: All code shelf-ready (backtest engine, walk-forward, risk management, broker abstraction, CI pipeline).
 
 ## Data Source: NSE UDiFF Bhavcopy
 

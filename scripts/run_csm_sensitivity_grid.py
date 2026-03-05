@@ -97,7 +97,12 @@ def main() -> int:
     parser.add_argument("--test-months", type=int, default=3)
     parser.add_argument("--capital", type=float, default=100000.0)
     parser.add_argument("--skip-recent-months", type=int, default=1)
-    parser.add_argument("--min-history-days", type=int, default=140)
+    parser.add_argument(
+        "--min-history-days",
+        type=int,
+        default=0,
+        help="Set >0 to force a fixed minimum history; default 0 uses adaptive lookback+skip.",
+    )
     parser.add_argument("--warmup-days", type=int, default=400)
     parser.add_argument("--target-vol", type=float, default=0.15)
     parser.add_argument("--min-exposure", type=float, default=0.25)
@@ -177,12 +182,18 @@ def main() -> int:
             continue
 
         print(f"[{idx}/{total}] run {key}")
+        lookback_months = int(combo["lookback_months"])
+        adaptive_min_history = max(20, (lookback_months + int(args.skip_recent_months)) * 20)
+        effective_min_history_days = (
+            int(args.min_history_days) if int(args.min_history_days) > 0 else int(adaptive_min_history)
+        )
+
         strategy = CrossSectionalMomentumStrategy(
             top_n=int(combo["top_n"]),
-            lookback_months=int(combo["lookback_months"]),
+            lookback_months=lookback_months,
             skip_recent_months=int(args.skip_recent_months),
             trailing_stop_pct=float(combo["trailing_stop_pct"]),
-            min_history_days=int(args.min_history_days),
+            min_history_days=effective_min_history_days,
             initial_capital=float(args.capital),
             crash_protection=bool(combo["crash_protection"]),
             target_vol=float(args.target_vol),
@@ -230,6 +241,7 @@ def main() -> int:
             row = {
                 "key": key,
                 "params": combo,
+                "effective_min_history_days": int(effective_min_history_days),
                 "status": "ok",
                 "summary": {
                     "avg_return": float(summary.get("avg_return", 0.0)),
@@ -239,6 +251,7 @@ def main() -> int:
                     "profitable_windows": int(summary.get("profitable_windows", 0)),
                     "total_windows": int(summary.get("total_windows", 0)),
                 },
+                "total_trade_count": int(sum(int(w.get("trades", 0)) for w in windows)),
                 "data_quality_warning_count_total": warning_count_total,
                 "zero_trade_consecutive": bool(zero_trade_consecutive),
                 "windows": [
@@ -269,7 +282,16 @@ def main() -> int:
         )
 
     successful = [r for r in result_rows if r.get("status") == "ok"]
+    viable = [r for r in successful if int(r.get("total_trade_count", 0)) > 0]
     ranked = sorted(
+        viable,
+        key=lambda r: (
+            float(r["summary"]["avg_sharpe"]),
+            float(r["summary"]["avg_return"]),
+        ),
+        reverse=True,
+    )
+    ranked_all = sorted(
         successful,
         key=lambda r: (
             float(r["summary"]["avg_sharpe"]),
@@ -280,7 +302,7 @@ def main() -> int:
     for rank, row in enumerate(ranked, start=1):
         row["rank"] = rank
 
-    kill_all_below = bool(successful) and all(float(r["summary"]["avg_sharpe"]) < -0.5 for r in successful)
+    kill_all_below = bool(viable) and all(float(r["summary"]["avg_sharpe"]) < -0.5 for r in viable)
     payload = {
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "reproducibility": {
@@ -299,6 +321,7 @@ def main() -> int:
             "capital": float(args.capital),
             "skip_recent_months": int(args.skip_recent_months),
             "min_history_days": int(args.min_history_days),
+            "adaptive_min_history_days": bool(int(args.min_history_days) <= 0),
             "warmup_days": int(args.warmup_days),
             "target_vol": float(args.target_vol),
             "min_exposure": float(args.min_exposure),
@@ -311,10 +334,13 @@ def main() -> int:
         },
         "kill_criterion": {
             "all_avg_sharpe_below_neg_0_5": kill_all_below,
-            "evaluated_configs": len(successful),
+            "evaluated_configs": len(viable),
+            "evaluated_configs_all_status_ok": len(successful),
+            "zero_trade_configs": int(len(successful) - len(viable)),
             "total_configs": len(combos),
         },
         "results_ranked": ranked,
+        "results_ranked_all": ranked_all,
         "results_all": result_rows,
     }
     _save_json(out_path, payload)
